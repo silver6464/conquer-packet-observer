@@ -1,0 +1,17 @@
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/bin/Debug/net8.0/conquer-rev-observer
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/bin/Debug/net8.0/conquer-rev-observer.deps.json
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/bin/Debug/net8.0/conquer-rev-observer.runtimeconfig.json
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/bin/Debug/net8.0/conquer-rev-observer.dll
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/bin/Debug/net8.0/conquer-rev-observer.pdb
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/bin/Debug/net8.0/BouncyCastle.Cryptography.dll
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.csproj.AssemblyReference.cache
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.GeneratedMSBuildEditorConfig.editorconfig
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.AssemblyInfoInputs.cache
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.AssemblyInfo.cs
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.csproj.CoreCompileInputs.cache
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-.C2CBF1E3.Up2Date
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.dll
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/refint/conquer-rev-observer.dll
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.pdb
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.genruntimeconfig.cache
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/ref/conquer-rev-observer.dll
