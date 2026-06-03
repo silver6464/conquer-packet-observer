@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("conquer-rev-observer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+33f8ff064f5d574a3be14cfdf3745881dd0bdf64")]
 [assembly: System.Reflection.AssemblyProductAttribute("conquer-rev-observer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("conquer-rev-observer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
