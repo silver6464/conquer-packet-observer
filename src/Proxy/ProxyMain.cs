@@ -354,18 +354,36 @@ namespace ConquerRevObserver
             }
         }
 
+        // Tri-state per direction: have we already replayed the backlog?
+        // DIAGNOSTIC MODE: we LOG the backlog raw but DO NOT feed it to the
+        // cipher. If the backlog represents bytes that the client didn't
+        // actually encrypt with the game BF_KEY (e.g. a plaintext-ish handshake
+        // on 5817), feeding them would corrupt the cipher state forever.
+        // We then start decryption from the first post-key fresh chunk with
+        // a virgin cipher state (IV=0). If that recovers sane packets, we
+        // know the pre-key bytes don't belong in the cipher stream.
+        private bool _s2cDrained, _c2sDrained;
+
         private void DrainAndDecrypt(GameKeyState state, bool isServerToClient, byte[] freshChunk, string tag)
         {
-            byte[] backlog = null;
-            lock (_pendingLock)
+            bool alreadyDrained = isServerToClient ? _s2cDrained : _c2sDrained;
+            if (!alreadyDrained)
             {
-                var pending = isServerToClient ? _s2cPending : _c2sPending;
-                if (pending.Length > 0)
+                byte[] backlog = null;
+                lock (_pendingLock)
                 {
-                    backlog = pending.ToArray();
-                    pending.SetLength(0);
-                    ProxyMain.Log("game", $"draining {backlog.Length} pre-key {tag} bytes through cipher");
-                    // Dump first 64 bytes raw so we can see what was sitting there.
+                    var pending = isServerToClient ? _s2cPending : _c2sPending;
+                    if (pending.Length > 0)
+                    {
+                        backlog = pending.ToArray();
+                        pending.SetLength(0);
+                    }
+                    if (isServerToClient) _s2cDrained = true;
+                    else                  _c2sDrained = true;
+                }
+                if (backlog != null && backlog.Length > 0)
+                {
+                    ProxyMain.Log("game", $"SKIPPING (not feeding to cipher) {backlog.Length} pre-key {tag} bytes");
                     var sb = new StringBuilder();
                     for (int i = 0; i < Math.Min(64, backlog.Length); i++)
                         sb.Append(backlog[i].ToString("X2")).Append(' ');
@@ -373,19 +391,8 @@ namespace ConquerRevObserver
                 }
             }
 
-            // CFB-64 cipher state is stateful per engine; serialize per-direction
-            // access. (S2C uses _decrypt, C2S uses _encrypt under the hood — they
-            // don't share state, so we only need one lock per direction. But the
-            // GameCryptography object is shared, so lock on it.)
             lock (state)
             {
-                if (backlog != null && backlog.Length > 0)
-                {
-                    var bpt = (byte[])backlog.Clone();
-                    if (isServerToClient) state.Crypto.DecryptS2c(bpt);
-                    else                  state.Crypto.DecryptC2s(bpt);
-                    WalkPackets(bpt, tag + " [backlog]");
-                }
                 var pt = (byte[])freshChunk.Clone();
                 if (isServerToClient) state.Crypto.DecryptS2c(pt);
                 else                  state.Crypto.DecryptC2s(pt);
