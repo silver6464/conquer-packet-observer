@@ -354,22 +354,29 @@ namespace ConquerRevObserver
             }
         }
 
-        // Tri-state per direction: have we already replayed the backlog?
-        // DIAGNOSTIC MODE: we LOG the backlog raw but DO NOT feed it to the
-        // cipher. If the backlog represents bytes that the client didn't
-        // actually encrypt with the game BF_KEY (e.g. a plaintext-ish handshake
-        // on 5817), feeding them would corrupt the cipher state forever.
-        // We then start decryption from the first post-key fresh chunk with
-        // a virgin cipher state (IV=0). If that recovers sane packets, we
-        // know the pre-key bytes don't belong in the cipher stream.
+        // Per-direction "have we already handled the pre-key backlog?" flag.
+        //
+        // Empirically determined behavior of Rev on 5817:
+        //   - s->c: server's pre-key bytes (~335 in observed runs) are NOT part
+        //     of the BF_cfb64 cipher stream. They're probably encrypted with
+        //     some other key (the 16-byte static key, maybe) for the connection
+        //     greeting before the 64-byte game key takes over. Feeding them
+        //     to the cipher corrupts state — so we DISCARD them and start
+        //     decryption from the first post-key chunk with a fresh IV=0.
+        //   - c->s: client's pre-key bytes (~202 in observed runs) ARE part
+        //     of the cipher stream from byte 1. The first 28 bytes are the
+        //     encrypted Connect packet (#1052). We MUST decrypt them or all
+        //     subsequent c->s bytes are off by N.
+        // The asymmetry is real and not a bug in our code; it's how the wire
+        // protocol works here.
         private bool _s2cDrained, _c2sDrained;
 
         private void DrainAndDecrypt(GameKeyState state, bool isServerToClient, byte[] freshChunk, string tag)
         {
             bool alreadyDrained = isServerToClient ? _s2cDrained : _c2sDrained;
+            byte[] backlog = null;
             if (!alreadyDrained)
             {
-                byte[] backlog = null;
                 lock (_pendingLock)
                 {
                     var pending = isServerToClient ? _s2cPending : _c2sPending;
@@ -381,18 +388,31 @@ namespace ConquerRevObserver
                     if (isServerToClient) _s2cDrained = true;
                     else                  _c2sDrained = true;
                 }
-                if (backlog != null && backlog.Length > 0)
-                {
-                    ProxyMain.Log("game", $"SKIPPING (not feeding to cipher) {backlog.Length} pre-key {tag} bytes");
-                    var sb = new StringBuilder();
-                    for (int i = 0; i < Math.Min(64, backlog.Length); i++)
-                        sb.Append(backlog[i].ToString("X2")).Append(' ');
-                    ProxyMain.Log("game", $"  pre-key {tag} hex[:64]: {sb}");
-                }
             }
 
             lock (state)
             {
+                if (backlog != null && backlog.Length > 0)
+                {
+                    if (isServerToClient)
+                    {
+                        // Discard — these aren't part of the BF_cfb64 game-key
+                        // stream. Start the s->c cipher fresh with IV=0 on the
+                        // next chunk (already what _decrypt is set to).
+                        ProxyMain.Log("game", $"discarding {backlog.Length} pre-key s->c bytes (not BF_cfb64-keyed)");
+                    }
+                    else
+                    {
+                        // Replay through the cipher so c->s state stays aligned
+                        // with the client's. We don't print these as packets —
+                        // they often contain the Connect packet + early traffic
+                        // that we capture from-here in steady-state anyway.
+                        var bpt = (byte[])backlog.Clone();
+                        state.Crypto.DecryptC2s(bpt);
+                        WalkPackets(bpt, tag + " [backlog]");
+                    }
+                }
+
                 var pt = (byte[])freshChunk.Clone();
                 if (isServerToClient) state.Crypto.DecryptS2c(pt);
                 else                  state.Crypto.DecryptC2s(pt);
