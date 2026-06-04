@@ -300,7 +300,49 @@ namespace ConquerRevObserver
 
             var sToC = Task.Run(() => ObservePump(_ss, _cs, "s->c", isServerToClient: true));
             var cToS = Task.Run(() => ObservePump(_cs, _ss, "c->s", isServerToClient: false));
+
+            // If a direction has stashed pre-key bytes but no fresh chunk has
+            // arrived since the keyfile loaded, the drain logic never runs and
+            // those bytes sit in the buffer forever. Watch for that and flush
+            // the backlog through DrainAndDecrypt as soon as the key is ready.
+            Task.Run(() => FlushBacklogsOnce());
+
             Task.WaitAny(sToC, cToS);
+        }
+
+        private void FlushBacklogsOnce()
+        {
+            // Wait for keyfile to load.
+            while (_keyState == null) Thread.Sleep(50);
+            // Force-drain whatever's already buffered in each direction by
+            // calling DrainAndDecrypt with an empty fresh chunk. The drain
+            // sets the `_*Drained` flag, so subsequent ObservePump reads
+            // won't re-drain.
+            lock (_pendingLock)
+            {
+                if (_c2sPending.Length > 0 && !_c2sDrained)
+                {
+                    var pending = _c2sPending.ToArray();
+                    _c2sPending.SetLength(0);
+                    _c2sDrained = true;
+                    ProxyMain.Log("game", $"flushing {pending.Length} stashed c->s bytes after keyfile load");
+                    // Release the lock before invoking decode (decode may itself
+                    // take the lock).
+                    Task.Run(() =>
+                    {
+                        lock (_keyState)
+                        {
+                            DecodeC2s(_keyState, pending, Array.Empty<byte>(), "c->s");
+                        }
+                    });
+                }
+                if (_s2cPending.Length > 0 && !_s2cDrained)
+                {
+                    _s2cPending.SetLength(0);
+                    _s2cDrained = true;
+                    ProxyMain.Log("game", $"discarding stashed s->c bytes (session-start handling)");
+                }
+            }
         }
 
         // Pre-keyfile ciphertext buffers. CFB-64 is stateful: the IV evolves
@@ -467,7 +509,8 @@ namespace ConquerRevObserver
             if (!_c2sGameKeyActive)
             {
                 // Accumulate raw + DR654-decrypted shadow.
-                if (backlog != null && backlog.Length > 0)
+                int backlogLen = backlog?.Length ?? 0;
+                if (backlogLen > 0)
                 {
                     _c2sRawAccum.Write(backlog, 0, backlog.Length);
                     var copy = (byte[])backlog.Clone();
@@ -483,10 +526,17 @@ namespace ConquerRevObserver
 
                 byte[] decrypted = _c2sLoginDecrypted.ToArray();
                 int trailerIdx = IndexOf(decrypted, TQ_CLIENT_TRAILER);
+                ProxyMain.Log("game",
+                    $"c->s DecodeC2s: backlog={backlogLen} fresh={freshChunk.Length} " +
+                    $"accum={decrypted.Length} trailerIdx={trailerIdx}");
                 if (trailerIdx < 0)
                 {
-                    // Auth packet still in progress. Don't try to walk packets
-                    // (it's an opaque blob anyway).
+                    // Hex-dump the first 32 decrypted bytes to confirm DR654
+                    // is working — should be plaintext-looking, not random.
+                    var sb = new StringBuilder();
+                    for (int i = 0; i < Math.Min(32, decrypted.Length); i++)
+                        sb.Append(decrypted[i].ToString("X2")).Append(' ');
+                    ProxyMain.Log("game", $"  decrypted[:32] = {sb}");
                     return;
                 }
 
