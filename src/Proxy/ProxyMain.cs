@@ -302,6 +302,16 @@ namespace ConquerRevObserver
             Task.WaitAny(sToC, cToS);
         }
 
+        // Pre-keyfile ciphertext buffers. CFB-64 is stateful: the IV evolves
+        // byte-by-byte as bytes pass through the cipher, so we MUST decrypt
+        // from byte 0 of the connection — we can't start mid-stream with a
+        // fresh IV. Until the keyfile arrives we buffer raw ciphertext per
+        // direction; once the key is loaded we drain the buffers through the
+        // cipher in order, then continue decrypting live bytes.
+        private readonly MemoryStream _s2cPending = new MemoryStream();
+        private readonly MemoryStream _c2sPending = new MemoryStream();
+        private readonly object _pendingLock = new object();
+
         private void ObservePump(NetworkStream from, NetworkStream to, string tag, bool isServerToClient)
         {
             var buf = new byte[8192];
@@ -321,18 +331,59 @@ namespace ConquerRevObserver
                 chunkIdx++;
 
                 var state = _keyState;
-                if (state != null)
+                if (state == null)
                 {
-                    var pt = (byte[])chunk.Clone();
-                    lock (state)
+                    // Key not ready yet — stash for replay once it arrives.
+                    lock (_pendingLock)
                     {
-                        if (isServerToClient) state.Crypto.DecryptS2c(pt);
-                        else                  state.Crypto.DecryptC2s(pt);
+                        var pending = isServerToClient ? _s2cPending : _c2sPending;
+                        pending.Write(chunk, 0, n);
                     }
-                    WalkPackets(pt, tag);
+                }
+                else
+                {
+                    // Drain any buffered ciphertext for this direction FIRST,
+                    // then decrypt this chunk. The drain happens at most once
+                    // per direction (after _keyState becomes non-null), but
+                    // we guard it with a lock+check anyway since both pumps
+                    // race for the key load.
+                    DrainAndDecrypt(state, isServerToClient, chunk, tag);
                 }
 
                 try { to.Write(chunk, 0, n); } catch { return; }
+            }
+        }
+
+        private void DrainAndDecrypt(GameKeyState state, bool isServerToClient, byte[] freshChunk, string tag)
+        {
+            byte[] backlog = null;
+            lock (_pendingLock)
+            {
+                var pending = isServerToClient ? _s2cPending : _c2sPending;
+                if (pending.Length > 0)
+                {
+                    backlog = pending.ToArray();
+                    pending.SetLength(0);
+                }
+            }
+
+            // CFB-64 cipher state is stateful per engine; serialize per-direction
+            // access. (S2C uses _decrypt, C2S uses _encrypt under the hood — they
+            // don't share state, so we only need one lock per direction. But the
+            // GameCryptography object is shared, so lock on it.)
+            lock (state)
+            {
+                if (backlog != null && backlog.Length > 0)
+                {
+                    var bpt = (byte[])backlog.Clone();
+                    if (isServerToClient) state.Crypto.DecryptS2c(bpt);
+                    else                  state.Crypto.DecryptC2s(bpt);
+                    WalkPackets(bpt, tag + " [backlog]");
+                }
+                var pt = (byte[])freshChunk.Clone();
+                if (isServerToClient) state.Crypto.DecryptS2c(pt);
+                else                  state.Crypto.DecryptC2s(pt);
+                WalkPackets(pt, tag);
             }
         }
 
