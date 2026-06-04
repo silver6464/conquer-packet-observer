@@ -418,12 +418,18 @@ namespace ConquerRevObserver
             {
                 if (isServerToClient)
                 {
-                    // s->c uses the game key from byte 0. Replay backlog if any.
+                    // Empirically: in some sessions the pre-keyfile s->c bytes
+                    // we forwarded DO align with what the client's BF_cfb64
+                    // decrypts after the keyfile loads; in others they don't
+                    // (the offset is off by an unknown amount, possibly because
+                    // of pipelined or server-buffered chunks that aren't 1:1
+                    // with what BF_cfb64 sees). Discarding the backlog and
+                    // starting fresh on the next live chunk is the more
+                    // reliable behavior. We'll lose the first few packets per
+                    // session but steady-state is what we care about.
                     if (backlog != null && backlog.Length > 0)
                     {
-                        var bpt = (byte[])backlog.Clone();
-                        state.Crypto.DecryptS2c(bpt);
-                        WalkPackets(bpt, tag + " [backlog]");
+                        ProxyMain.Log("game", $"discarding {backlog.Length} pre-keyfile s->c bytes (session start lost)");
                     }
                     var pt = (byte[])freshChunk.Clone();
                     state.Crypto.DecryptS2c(pt);
