@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -435,13 +436,85 @@ namespace ConquerRevObserver
             }
         }
 
+        // Auth packet has no [u16-len][u16-type] header — its body is an opaque
+        // login blob, so we can't predict the end from a header read. We detect
+        // the boundary by scanning DR654-decrypted bytes for the ASCII trailer
+        // "TQClient" (8 bytes), which the client appends to every packet.
+        //
+        // Strategy: accumulate raw c->s ciphertext into _c2sRawAccum until we
+        // can identify the boundary. We do this by maintaining a shadow DR654
+        // decryption alongside the raw bytes: every byte we add to the raw
+        // accumulator, we also add to a parallel decrypted accumulator. When
+        // "TQClient" appears in the decrypted accumulator at position P, the
+        // auth packet is the first (P+8) raw bytes; everything after that is
+        // game-key ciphertext.
+        private static readonly byte[] TQ_CLIENT_TRAILER =
+            new byte[] { 0x54, 0x51, 0x43, 0x6C, 0x69, 0x65, 0x6E, 0x74 };
+        private readonly MemoryStream _c2sRawAccum = new MemoryStream();
+        private readonly MemoryStream _c2sLoginDecrypted = new MemoryStream();
+
         private void DecodeC2s(GameKeyState state, byte[] backlog, byte[] freshChunk, string tag)
         {
             if (_c2sLoginCipher == null)
                 _c2sLoginCipher = new GameCryptography(Common.ENCRYPTION_KEY);
 
-            // Concatenate backlog + freshChunk so an auth-packet boundary that
-            // straddles the chunk seam is handled in one pass.
+            if (!_c2sGameKeyActive)
+            {
+                // Accumulate raw + DR654-decrypted shadow.
+                if (backlog != null && backlog.Length > 0)
+                {
+                    _c2sRawAccum.Write(backlog, 0, backlog.Length);
+                    var copy = (byte[])backlog.Clone();
+                    _c2sLoginCipher.DecryptC2s(copy);
+                    _c2sLoginDecrypted.Write(copy, 0, copy.Length);
+                }
+                _c2sRawAccum.Write(freshChunk, 0, freshChunk.Length);
+                {
+                    var copy = (byte[])freshChunk.Clone();
+                    _c2sLoginCipher.DecryptC2s(copy);
+                    _c2sLoginDecrypted.Write(copy, 0, copy.Length);
+                }
+
+                byte[] decrypted = _c2sLoginDecrypted.ToArray();
+                int trailerIdx = IndexOf(decrypted, TQ_CLIENT_TRAILER);
+                if (trailerIdx < 0)
+                {
+                    // Auth packet still in progress. Don't try to walk packets
+                    // (it's an opaque blob anyway).
+                    return;
+                }
+
+                int authPacketEnd = trailerIdx + TQ_CLIENT_TRAILER.Length;
+                ProxyMain.Log("game", $"c->s auth (DR654) ended at offset {authPacketEnd} (TQClient trailer)");
+
+                // Emit the auth packet for visibility — re-extract from decrypted.
+                var authPacket = new byte[authPacketEnd];
+                Buffer.BlockCopy(decrypted, 0, authPacket, 0, authPacketEnd);
+                WalkPackets(authPacket, tag + " [auth]");
+
+                // Now switch to game key. Decrypt the post-auth RAW bytes (still
+                // unmolested in _c2sRawAccum) with the game key. The c->s game
+                // engine has not been used yet, so it's at IV=0 — correct for
+                // the start of the game-key cipher stream from the client.
+                byte[] rawAll = _c2sRawAccum.ToArray();
+                int postAuthLen = rawAll.Length - authPacketEnd;
+                _c2sGameKeyActive = true;
+
+                if (postAuthLen > 0)
+                {
+                    var postAuth = new byte[postAuthLen];
+                    Buffer.BlockCopy(rawAll, authPacketEnd, postAuth, 0, postAuthLen);
+                    state.Crypto.DecryptC2s(postAuth);
+                    WalkPackets(postAuth, tag);
+                }
+
+                // Free the shadow buffers — we won't need them again.
+                _c2sRawAccum.SetLength(0);
+                _c2sLoginDecrypted.SetLength(0);
+                return;
+            }
+
+            // Steady-state: game key.
             byte[] combined;
             if (backlog != null && backlog.Length > 0)
             {
@@ -453,71 +526,44 @@ namespace ConquerRevObserver
             {
                 combined = (byte[])freshChunk.Clone();
             }
-
-            int offset = 0;
-
-            // Phase 1: DR654-encrypted auth segment.
-            if (!_c2sGameKeyActive)
-            {
-                if (_c2sLoginBytesRemaining < 0)
-                {
-                    // Need at least 4 bytes (u16 length + u16 type) to know where
-                    // the auth packet ends.
-                    if (combined.Length < 4)
-                    {
-                        lock (_pendingLock)
-                        {
-                            _c2sPending.Write(combined, 0, combined.Length);
-                            _c2sDrained = false;
-                        }
-                        return;
-                    }
-                    _c2sLoginCipher.DecryptC2sSlice(combined, 0, 4);
-                    int authLen = combined[0] | (combined[1] << 8);
-                    int authType = combined[2] | (combined[3] << 8);
-                    if (authLen < 4 || authLen > 4096)
-                    {
-                        ProxyMain.Log("game", $"c->s auth header looks bogus (len={authLen} type={authType}); aborting key-switch logic");
-                        return;
-                    }
-                    _c2sLoginBytesRemaining = authLen - 4;
-                    ProxyMain.Log("game", $"c->s auth (DR654): len={authLen} type={authType}");
-                    offset = 4;
-                }
-                int loginSlice = Math.Min(_c2sLoginBytesRemaining, combined.Length - offset);
-                if (loginSlice > 0)
-                {
-                    _c2sLoginCipher.DecryptC2sSlice(combined, offset, loginSlice);
-                    offset += loginSlice;
-                    _c2sLoginBytesRemaining -= loginSlice;
-                }
-                if (_c2sLoginBytesRemaining == 0)
-                {
-                    _c2sGameKeyActive = true;
-                    ProxyMain.Log("game", "c->s switched to game key");
-                }
-            }
-
-            // Phase 2: game key for the remainder.
-            if (_c2sGameKeyActive && offset < combined.Length)
-            {
-                state.Crypto.DecryptC2sSlice(combined, offset, combined.Length - offset);
-            }
-
+            state.Crypto.DecryptC2s(combined);
             WalkPackets(combined, tag);
+        }
+
+        private static int IndexOf(byte[] haystack, byte[] needle)
+        {
+            for (int i = 0; i + needle.Length <= haystack.Length; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < needle.Length; j++)
+                {
+                    if (haystack[i + j] != needle[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
         }
 
         private void KeyfileWatcher()
         {
-            // Poll for the first session_*.json we haven't already consumed.
+            // Poll for the NEWEST session_*.json we haven't consumed yet. Sort
+            // by last-write time descending so a stale keyfile from a previous
+            // run can't be picked up before the freshly-captured one.
             // Rename to .used after load so subsequent connections don't reuse it.
+            // The watcher also only considers files that started life AFTER the
+            // proxy session began — anything older is treated as stale.
+            var sessionStart = DateTime.UtcNow;
             while (_keyState == null)
             {
                 try
                 {
                     if (Directory.Exists(ProxyMain.KeyfileDir))
                     {
-                        foreach (var f in Directory.GetFiles(ProxyMain.KeyfileDir, "session_*.json"))
+                        var files = Directory.GetFiles(ProxyMain.KeyfileDir, "session_*.json")
+                            .Where(p => File.GetLastWriteTimeUtc(p) >= sessionStart)
+                            .OrderByDescending(p => File.GetLastWriteTimeUtc(p))
+                            .ToArray();
+                        foreach (var f in files)
                         {
                             try
                             {
