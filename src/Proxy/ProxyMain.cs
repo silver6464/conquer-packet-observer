@@ -378,22 +378,21 @@ namespace ConquerRevObserver
             }
         }
 
-        // Per-direction "have we already handled the pre-key backlog?" flag.
-        //
-        // Empirically determined behavior of Rev on 5817:
-        //   - s->c: server's pre-key bytes (~335 in observed runs) are NOT part
-        //     of the BF_cfb64 cipher stream. They're probably encrypted with
-        //     some other key (the 16-byte static key, maybe) for the connection
-        //     greeting before the 64-byte game key takes over. Feeding them
-        //     to the cipher corrupts state — so we DISCARD them and start
-        //     decryption from the first post-key chunk with a fresh IV=0.
-        //   - c->s: client's pre-key bytes (~202 in observed runs) ARE part
-        //     of the cipher stream from byte 1. The first 28 bytes are the
-        //     encrypted Connect packet (#1052). We MUST decrypt them or all
-        //     subsequent c->s bytes are off by N.
-        // The asymmetry is real and not a bug in our code; it's how the wire
-        // protocol works here.
+        // Two-key c->s decoding on 5817 (Frida-verified):
+        //   - First c->s bytes the client sends are ONE auth packet (variable
+        //     length — ~167 bytes in observed runs) encrypted with the static
+        //     DR654 key, NOT the game key. Length comes from the standard
+        //     TQ u16-LE header after DR654 decryption.
+        //   - Everything after that auth packet (starting with the Connect
+        //     packet #1052) uses the 64-byte DH-derived game key with IV=0.
+        //   - s->c is single-key: game key from byte 0, IV=0, no DR654 phase.
+        // This asymmetry is in the wire protocol, not a bug here.
         private bool _s2cDrained, _c2sDrained;
+
+        // c->s key-transition state.
+        private GameCryptography _c2sLoginCipher;   // DR654, lazily created
+        private int _c2sLoginBytesRemaining = -1;   // -1 = haven't parsed auth length yet
+        private bool _c2sGameKeyActive;             // once true, c->s uses game key
 
         private void DrainAndDecrypt(GameKeyState state, bool isServerToClient, byte[] freshChunk, string tag)
         {
@@ -416,32 +415,96 @@ namespace ConquerRevObserver
 
             lock (state)
             {
-                if (backlog != null && backlog.Length > 0)
+                if (isServerToClient)
                 {
-                    if (isServerToClient)
+                    // s->c uses the game key from byte 0. Replay backlog if any.
+                    if (backlog != null && backlog.Length > 0)
                     {
-                        // Discard — these aren't part of the BF_cfb64 game-key
-                        // stream. Start the s->c cipher fresh with IV=0 on the
-                        // next chunk (already what _decrypt is set to).
-                        ProxyMain.Log("game", $"discarding {backlog.Length} pre-key s->c bytes (not BF_cfb64-keyed)");
-                    }
-                    else
-                    {
-                        // Replay through the cipher so c->s state stays aligned
-                        // with the client's. We don't print these as packets —
-                        // they often contain the Connect packet + early traffic
-                        // that we capture from-here in steady-state anyway.
                         var bpt = (byte[])backlog.Clone();
-                        state.Crypto.DecryptC2s(bpt);
+                        state.Crypto.DecryptS2c(bpt);
                         WalkPackets(bpt, tag + " [backlog]");
                     }
+                    var pt = (byte[])freshChunk.Clone();
+                    state.Crypto.DecryptS2c(pt);
+                    WalkPackets(pt, tag);
                 }
-
-                var pt = (byte[])freshChunk.Clone();
-                if (isServerToClient) state.Crypto.DecryptS2c(pt);
-                else                  state.Crypto.DecryptC2s(pt);
-                WalkPackets(pt, tag);
+                else
+                {
+                    DecodeC2s(state, backlog, freshChunk, tag);
+                }
             }
+        }
+
+        private void DecodeC2s(GameKeyState state, byte[] backlog, byte[] freshChunk, string tag)
+        {
+            if (_c2sLoginCipher == null)
+                _c2sLoginCipher = new GameCryptography(Common.ENCRYPTION_KEY);
+
+            // Concatenate backlog + freshChunk so an auth-packet boundary that
+            // straddles the chunk seam is handled in one pass.
+            byte[] combined;
+            if (backlog != null && backlog.Length > 0)
+            {
+                combined = new byte[backlog.Length + freshChunk.Length];
+                Buffer.BlockCopy(backlog, 0, combined, 0, backlog.Length);
+                Buffer.BlockCopy(freshChunk, 0, combined, backlog.Length, freshChunk.Length);
+            }
+            else
+            {
+                combined = (byte[])freshChunk.Clone();
+            }
+
+            int offset = 0;
+
+            // Phase 1: DR654-encrypted auth segment.
+            if (!_c2sGameKeyActive)
+            {
+                if (_c2sLoginBytesRemaining < 0)
+                {
+                    // Need at least 4 bytes (u16 length + u16 type) to know where
+                    // the auth packet ends.
+                    if (combined.Length < 4)
+                    {
+                        lock (_pendingLock)
+                        {
+                            _c2sPending.Write(combined, 0, combined.Length);
+                            _c2sDrained = false;
+                        }
+                        return;
+                    }
+                    _c2sLoginCipher.DecryptC2sSlice(combined, 0, 4);
+                    int authLen = combined[0] | (combined[1] << 8);
+                    int authType = combined[2] | (combined[3] << 8);
+                    if (authLen < 4 || authLen > 4096)
+                    {
+                        ProxyMain.Log("game", $"c->s auth header looks bogus (len={authLen} type={authType}); aborting key-switch logic");
+                        return;
+                    }
+                    _c2sLoginBytesRemaining = authLen - 4;
+                    ProxyMain.Log("game", $"c->s auth (DR654): len={authLen} type={authType}");
+                    offset = 4;
+                }
+                int loginSlice = Math.Min(_c2sLoginBytesRemaining, combined.Length - offset);
+                if (loginSlice > 0)
+                {
+                    _c2sLoginCipher.DecryptC2sSlice(combined, offset, loginSlice);
+                    offset += loginSlice;
+                    _c2sLoginBytesRemaining -= loginSlice;
+                }
+                if (_c2sLoginBytesRemaining == 0)
+                {
+                    _c2sGameKeyActive = true;
+                    ProxyMain.Log("game", "c->s switched to game key");
+                }
+            }
+
+            // Phase 2: game key for the remainder.
+            if (_c2sGameKeyActive && offset < combined.Length)
+            {
+                state.Crypto.DecryptC2sSlice(combined, offset, combined.Length - offset);
+            }
+
+            WalkPackets(combined, tag);
         }
 
         private void KeyfileWatcher()

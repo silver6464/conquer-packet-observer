@@ -59,6 +59,24 @@ namespace ConquerPoc.Cryptography
         {
             _decrypt.ProcessBytes(packet, false);
         }
+
+        // Decrypt a slice in place (offset, count) — used when we need to
+        // decrypt only part of a chunk through one of the engines.
+        public void DecryptC2sSlice(byte[] packet, int offset, int count)
+        {
+            var slice = new byte[count];
+            System.Buffer.BlockCopy(packet, offset, slice, 0, count);
+            _encrypt.ProcessBytes(slice, false);
+            System.Buffer.BlockCopy(slice, 0, packet, offset, count);
+        }
+
+        public void DecryptS2cSlice(byte[] packet, int offset, int count)
+        {
+            var slice = new byte[count];
+            System.Buffer.BlockCopy(packet, offset, slice, 0, count);
+            _decrypt.ProcessBytes(slice, false);
+            System.Buffer.BlockCopy(slice, 0, packet, offset, count);
+        }
     }
 
     /// <summary>
