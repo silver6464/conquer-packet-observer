@@ -15,3 +15,4 @@
 /Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.pdb
 /Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.genruntimeconfig.cache
 /Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/ref/conquer-rev-observer.dll
+/Users/silvergems.serate/Documents/silver/proj/conquer-rev-observer/obj/Debug/net8.0/conquer-rev-observer.sourcelink.json

@@ -33,6 +33,32 @@ namespace ConquerPoc.Cryptography
             _encrypt.Init(_key, encryptIv);
             _decrypt.Init(_key, decryptIv);
         }
+
+        // Bypass key-schedule derivation: load pre-computed P/S arrays into the
+        // engines. Rev's client uses ONE BF_KEY for both directions on 5817 —
+        // only IV/num differ per direction — so we load the same schedule into
+        // both engines. Both start with IV=0x00..00 (matches the client's
+        // first cfb64 call after BF_set_key, where the caller-maintained IV
+        // is still zero).
+        public void LoadSchedules(uint[] p, uint[] s)
+        {
+            var zeroIv = new byte[8];
+            _encrypt.LoadSchedule(p, s, zeroIv);
+            _decrypt.LoadSchedule(p, s, zeroIv);
+        }
+
+        // Observer-mode decrypters. CFB-64 decrypt and encrypt feed the IV differently
+        // (encrypt feeds output byte, decrypt feeds input byte), so we MUST use
+        // ProcessBytes(_, encrypting:false) on both.
+        public void DecryptC2s(byte[] packet)
+        {
+            _encrypt.ProcessBytes(packet, false);
+        }
+
+        public void DecryptS2c(byte[] packet)
+        {
+            _decrypt.ProcessBytes(packet, false);
+        }
     }
 
     /// <summary>
@@ -55,6 +81,13 @@ namespace ConquerPoc.Cryptography
         public void Init(byte[] key, byte[] iv)
         {
             _engine.SetKey(key);
+            System.Array.Copy(iv, _feedback, 8);
+            _idx = 0;
+        }
+
+        public void LoadSchedule(uint[] p, uint[] s, byte[] iv)
+        {
+            _engine.LoadSchedule(p, s);
             System.Array.Copy(iv, _feedback, 8);
             _idx = 0;
         }
@@ -120,6 +153,20 @@ namespace ConquerPoc.Cryptography
             for (int i = 0; i < 256; i += 2) { EncryptPair(ref l, ref r); _s1[i] = l; _s1[i + 1] = r; }
             for (int i = 0; i < 256; i += 2) { EncryptPair(ref l, ref r); _s2[i] = l; _s2[i + 1] = r; }
             for (int i = 0; i < 256; i += 2) { EncryptPair(ref l, ref r); _s3[i] = l; _s3[i + 1] = r; }
+        }
+
+        // Direct load of the OpenSSL BF_KEY layout: P[18] then S[4][256], total 4168 bytes
+        // worth of state but expressed here as already-decoded uint arrays. Skips the
+        // SetKey schedule derivation entirely.
+        public void LoadSchedule(uint[] p, uint[] s)
+        {
+            if (p.Length != 18) throw new System.ArgumentException("P-array must be 18 entries", nameof(p));
+            if (s.Length != 1024) throw new System.ArgumentException("S-array must be 4*256=1024 entries", nameof(s));
+            System.Array.Copy(p, _p, 18);
+            System.Array.Copy(s, 0, _s0, 0, 256);
+            System.Array.Copy(s, 256, _s1, 0, 256);
+            System.Array.Copy(s, 512, _s2, 0, 256);
+            System.Array.Copy(s, 768, _s3, 0, 256);
         }
 
         public void EncryptBlock(byte[] inBuf, int inOff, byte[] outBuf, int outOff)

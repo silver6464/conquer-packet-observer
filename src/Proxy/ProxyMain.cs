@@ -33,11 +33,28 @@ namespace ConquerRevObserver
         private const int REV_LOGIN_PORT = 9959;
         private const int REV_GAME_PORT = 5817;
 
+        // Directory the proxy watches for Frida-captured keyfiles. When a session.json
+        // appears here, the next 5817 connection switches from MitM-DH mode to
+        // observe-only mode (passthrough ciphertext, decrypt locally using the
+        // captured BF_KEY schedules).
+        public static string KeyfileDir { get; private set; } =
+            System.IO.Path.Combine(AppContext.BaseDirectory, "captures", "keys");
+
         public static void Main(string[] args)
         {
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--keyfile-dir" && i + 1 < args.Length)
+                {
+                    KeyfileDir = args[++i];
+                }
+            }
+            Directory.CreateDirectory(KeyfileDir);
+
             var listener = new TcpListener(IPAddress.Any, LISTEN_PORT);
             listener.Start();
             Log("proxy", $"SOCKS5 observer listening on 0.0.0.0:{LISTEN_PORT}");
+            Log("proxy", $"Watching keyfile dir: {KeyfileDir}");
             Log("proxy", "Configure Proxifier: Proxy Server type=SOCKS5, host=<this machine's Tailscale IP>, port=1080");
             Log("proxy", "Then a Proxification Rule: match Conquer.exe -> action: that proxy server");
 
@@ -175,14 +192,18 @@ namespace ConquerRevObserver
                 _cs.ReadTimeout = Timeout.Infinite;
                 _ss.ReadTimeout = Timeout.Infinite;
 
-                // Game port (5817): try Blowfish DH handshake to decrypt traffic.
-                // If the Rev server doesn't send a hello within 10s (we observed this on the
-                // FIRST 5817 attempt of a session) OR if the bytes don't parse as a 5065-shape
-                // ServerKeyPacket, BridgeGame falls back to raw passthrough automatically so
-                // login isn't blocked.
+                // Game port (5817): two modes.
+                //   - Keyfile mode: a Frida-captured session.json is in KeyfileDir, OR
+                //     will arrive while this connection is alive. We do NOT attempt
+                //     MitM-DH. Forward bytes untouched. When the keyfile appears, the
+                //     pumps start decrypting locally — they don't re-encrypt because
+                //     we're matched 1:1 with the client's cipher state, so the server
+                //     never sees a proxy.
+                //   - DH mode: legacy path that tries to mediate the handshake itself.
+                //     Kept for environments where the schedule isn't being captured.
                 // Other ports: raw passthrough.
                 if (_destPort == ProxyMainPorts.REV_GAME_PORT)
-                    BridgeGame();
+                    BridgeGameObserveOnly();
                 else
                     BridgeRaw();
             }
@@ -254,6 +275,98 @@ namespace ConquerRevObserver
         private void SocksReplyErr(byte code)
         {
             try { _cs.Write(new byte[] { 0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, 0, 10); } catch { }
+        }
+
+        // ============================================================
+        // Game port (5817), keyfile mode: forward ciphertext untouched, watch
+        // for a Frida-captured session.json, and start decrypting locally once
+        // it's available. The proxy never re-encrypts in this mode — it's a
+        // pure observer that happens to know the same key the client knows.
+        //
+        // Rev's wire format on 5817 is post-DH from byte 1: the 64-byte game
+        // BF_KEY is set up via the login flow on 9959, and 5817 is encrypted
+        // with it from the first byte. IV starts at 0 for both directions on
+        // each new TCP connection. So the pumps decrypt from byte 0, no
+        // cutover math needed.
+        // ============================================================
+        private GameKeyState _keyState;     // null until keyfile arrives
+
+        private void BridgeGameObserveOnly()
+        {
+            ProxyMain.Log("game", "observe-only mode: forwarding ciphertext, watching for keyfile");
+
+            Task.Run(() => KeyfileWatcher());
+
+            var sToC = Task.Run(() => ObservePump(_ss, _cs, "s->c", isServerToClient: true));
+            var cToS = Task.Run(() => ObservePump(_cs, _ss, "c->s", isServerToClient: false));
+            Task.WaitAny(sToC, cToS);
+        }
+
+        private void ObservePump(NetworkStream from, NetworkStream to, string tag, bool isServerToClient)
+        {
+            var buf = new byte[8192];
+            int chunkIdx = 0;
+            while (true)
+            {
+                int n;
+                try { n = from.Read(buf, 0, buf.Length); }
+                catch { return; }
+                if (n <= 0) return;
+
+                var chunk = new byte[n];
+                Buffer.BlockCopy(buf, 0, chunk, 0, n);
+
+                // Always capture raw ciphertext to disk for offline replay.
+                CaptureChunk(chunk, n, isServerToClient, chunkIdx);
+                chunkIdx++;
+
+                var state = _keyState;
+                if (state != null)
+                {
+                    var pt = (byte[])chunk.Clone();
+                    lock (state)
+                    {
+                        if (isServerToClient) state.Crypto.DecryptS2c(pt);
+                        else                  state.Crypto.DecryptC2s(pt);
+                    }
+                    WalkPackets(pt, tag);
+                }
+
+                try { to.Write(chunk, 0, n); } catch { return; }
+            }
+        }
+
+        private void KeyfileWatcher()
+        {
+            // Poll for the first session_*.json we haven't already consumed.
+            // Rename to .used after load so subsequent connections don't reuse it.
+            while (_keyState == null)
+            {
+                try
+                {
+                    if (Directory.Exists(ProxyMain.KeyfileDir))
+                    {
+                        foreach (var f in Directory.GetFiles(ProxyMain.KeyfileDir, "session_*.json"))
+                        {
+                            try
+                            {
+                                var state = GameKeyState.LoadFrom(f);
+                                if (state == null) continue;
+                                File.Move(f, f + ".used");
+                                _keyState = state;
+                                ProxyMain.Log("game", $"loaded keyfile {Path.GetFileName(f)}");
+                                return;
+                            }
+                            catch (Exception e)
+                            {
+                                ProxyMain.Log("game", $"keyfile load failed for {f}: {e.Message}");
+                            }
+                        }
+                    }
+                }
+                catch { }
+                Thread.Sleep(200);
+            }
         }
 
         // ============================================================
@@ -700,5 +813,56 @@ namespace ConquerRevObserver
     {
         public const int REV_GAME_PORT = 5817;
         public const int REV_LOGIN_PORT = 9959;
+    }
+
+    // Holds the Frida-captured game-port BF_KEY schedule. Rev's client uses
+    // one shared schedule for both directions on 5817 (only IV/num differ),
+    // and the first cfb64 call after BF_set_key starts at IV=0. So:
+    //   - no cutover offset (decrypt from byte 0 of the 5817 stream)
+    //   - no per-direction IV (both directions start at IV=0)
+    //   - one P/S array, loaded into both engines
+    internal sealed class GameKeyState
+    {
+        public GameCryptography Crypto;
+
+        public static GameKeyState LoadFrom(string path)
+        {
+            // session.json shape (v2):
+            // {
+            //   "version": 2,
+            //   "p": [18 hex uint32],
+            //   "s": [1024 hex uint32]
+            // }
+            string text = File.ReadAllText(path);
+            uint[] p = ParseUintArray(text, "p", 18);
+            uint[] s = ParseUintArray(text, "s", 1024);
+
+            var state = new GameKeyState
+            {
+                Crypto = new GameCryptography(new byte[] { 0 }), // dummy init, replaced below
+            };
+            state.Crypto.LoadSchedules(p, s);
+            return state;
+        }
+
+        private static uint[] ParseUintArray(string body, string key, int expectedLen)
+        {
+            int k = body.IndexOf("\"" + key + "\"");
+            if (k < 0) throw new FormatException("missing " + key);
+            int br = body.IndexOf('[', k);
+            int en = body.IndexOf(']', br);
+            string inner = body.Substring(br + 1, en - br - 1);
+            var parts = inner.Split(',');
+            if (parts.Length != expectedLen)
+                throw new FormatException($"{key}: expected {expectedLen} entries, got {parts.Length}");
+            var arr = new uint[expectedLen];
+            for (int i = 0; i < expectedLen; i++)
+            {
+                string raw = parts[i].Trim().Trim('"');
+                if (raw.StartsWith("0x") || raw.StartsWith("0X")) raw = raw.Substring(2);
+                arr[i] = Convert.ToUInt32(raw, 16);
+            }
+            return arr;
+        }
     }
 }
