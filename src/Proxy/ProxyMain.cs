@@ -364,6 +364,12 @@ namespace ConquerRevObserver
                 {
                     backlog = pending.ToArray();
                     pending.SetLength(0);
+                    ProxyMain.Log("game", $"draining {backlog.Length} pre-key {tag} bytes through cipher");
+                    // Dump first 64 bytes raw so we can see what was sitting there.
+                    var sb = new StringBuilder();
+                    for (int i = 0; i < Math.Min(64, backlog.Length); i++)
+                        sb.Append(backlog[i].ToString("X2")).Append(' ');
+                    ProxyMain.Log("game", $"  pre-key {tag} hex[:64]: {sb}");
                 }
             }
 
