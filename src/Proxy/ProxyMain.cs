@@ -312,6 +312,8 @@ namespace ConquerRevObserver
         private readonly MemoryStream _c2sPending = new MemoryStream();
         private readonly object _pendingLock = new object();
 
+        private bool _loggedFirstC2sRaw, _loggedFirstS2cRaw;
+
         private void ObservePump(NetworkStream from, NetworkStream to, string tag, bool isServerToClient)
         {
             var buf = new byte[8192];
@@ -325,6 +327,28 @@ namespace ConquerRevObserver
 
                 var chunk = new byte[n];
                 Buffer.BlockCopy(buf, 0, chunk, 0, n);
+
+                // One-time raw dump per direction for cross-checking with Frida's
+                // captured plaintext/ciphertext. The first 64 bytes the proxy
+                // forwards on each direction should correspond to the first
+                // cfb64 call(s) Frida sees.
+                lock (this)
+                {
+                    if (isServerToClient && !_loggedFirstS2cRaw)
+                    {
+                        _loggedFirstS2cRaw = true;
+                        var sb = new StringBuilder();
+                        for (int i = 0; i < Math.Min(64, n); i++) sb.Append(chunk[i].ToString("X2")).Append(' ');
+                        ProxyMain.Log("game", $"FIRST s->c raw[:64]: {sb}");
+                    }
+                    else if (!isServerToClient && !_loggedFirstC2sRaw)
+                    {
+                        _loggedFirstC2sRaw = true;
+                        var sb = new StringBuilder();
+                        for (int i = 0; i < Math.Min(64, n); i++) sb.Append(chunk[i].ToString("X2")).Append(' ');
+                        ProxyMain.Log("game", $"FIRST c->s raw[:64]: {sb}");
+                    }
+                }
 
                 // Always capture raw ciphertext to disk for offline replay.
                 CaptureChunk(chunk, n, isServerToClient, chunkIdx);

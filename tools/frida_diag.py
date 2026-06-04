@@ -88,6 +88,13 @@ const installHooks = function () {
         }
     });
 
+    // Track first cfb64 call per (bfkey, direction). On the first call for
+    // a direction, dump the full plaintext and full output ciphertext, plus
+    // the IV state. This lets us verify whether the proxy is seeing the
+    // same ciphertext on the wire that the client just produced, and whether
+    // the IV at first call is really 0.
+    const firstSeen = {};  // map "k|enc" -> true
+
     Interceptor.attach(cfb, {
         onEnter: function (args) {
             const inbuf  = args[0];
@@ -103,16 +110,25 @@ const installHooks = function () {
             st.cfb64Calls++;
             st.bytesSinceKey += length;
 
-            // For brevity, log only when cfb64Calls is small (so we can see
-            // the handshake pattern without drowning in steady-state traffic).
-            // After 20 calls per pointer, throttle: only log every 50th.
+            const dir = (enc === 1) ? 'c2s' : 's2c';
+            const firstKey = k + '|' + enc;
+
+            if (!firstSeen[firstKey]) {
+                firstSeen[firstKey] = true;
+                const ivHex = ivec.isNull() ? '?' : hex16(ivec, 8);
+                const fullIn = inbuf.isNull() ? '?' : hex16(inbuf, length);
+                console.log('[FIRST ' + dir + '] bfkey=' + k +
+                            '  len=' + length +
+                            '  iv=' + ivHex);
+                console.log('  plaintext-in  = ' + fullIn);
+                // Save outbuf to dump in onLeave (ciphertext on c2s, plaintext on s2c)
+                this.dumpAfter = { dir: dir, outbuf: outbuf, length: length };
+                return;
+            }
+
             const shouldLog = st.cfb64Calls <= 20 || (st.cfb64Calls % 50 === 0);
             if (shouldLog) {
-                const dir = (enc === 1) ? 'c2s' : 's2c';
                 const ivHex = ivec.isNull() ? '?' : hex16(ivec, 8);
-                // For c2s (enc=1), inbuf is plaintext on entry. For s2c, inbuf
-                // is ciphertext; we'd need onLeave to see plaintext. To keep
-                // this synchronous, just dump 4 bytes of in-buffer regardless.
                 const sample = !inbuf.isNull() ? hex16(inbuf, Math.min(length, 4)) : '?';
                 console.log('[E #' + st.cfb64Calls + '] bfkey=' + k +
                             '  ' + dir +
@@ -121,6 +137,18 @@ const installHooks = function () {
                             '  in[:4]=' + sample +
                             '  (total_since_key=' + st.bytesSinceKey + ')');
             }
+        },
+        onLeave: function (_retval) {
+            if (!this.dumpAfter) return;
+            const d = this.dumpAfter;
+            try {
+                const out = hex16(d.outbuf, d.length);
+                if (d.dir === 'c2s') {
+                    console.log('  ciphertext-out = ' + out);
+                } else {
+                    console.log('  plaintext-out  = ' + out);
+                }
+            } catch (e) { console.error('  out dump err: ' + e); }
         }
     });
 
