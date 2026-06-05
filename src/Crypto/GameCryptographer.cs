@@ -168,30 +168,19 @@ namespace ConquerPoc.Cryptography
         {
             _engine.LoadSchedule(p, s);
             System.Array.Copy(iv, _feedback, 8);
-            _idx = num & 7;
-            if (_idx != 0)
-            {
-                // Reconstruct the keystream the client is part-way through.
-                // OpenSSL stores the post-encrypt block back into ivec, then
-                // when it XORs each byte it overwrites ivec[num] with either
-                // input (decrypt) or output (encrypt). So at snapshot time,
-                // ivec[num..7] is the unused tail of the encrypted block,
-                // and ivec[0..num-1] is the feedback for the next block.
-                //
-                // Our ProcessBytes computes a fresh keystream when _idx==0
-                // by encrypting _feedback. If we set _idx=num, we need
-                // _keystream to be the SAME block that the client currently
-                // has half-consumed. The simplest reconstruction is: copy
-                // ivec into _keystream (its tail bytes are the unused
-                // keystream), and accept that _feedback already holds the
-                // full evolving IV for the *next* block.
-                //
-                // This is only exactly right when num != 0 and the client
-                // captured ivec from inside an OpenSSL BF_cfb64 call —
-                // which matches our Frida snapshot point. If num==0 the
-                // standard LoadSchedule path is fine.
-                System.Array.Copy(iv, _keystream, 8);
-            }
+            // QUICK EXPERIMENT (2026-06-06): force _idx=0 regardless of
+            // captured num. The num-resume reconstruction (copying iv into
+            // _keystream for non-zero num) decoded c->s cleanly when num was
+            // 4 but left s->c garbled at num=5. The two ought to behave the
+            // same since the cipher engine is symmetric, suggesting the
+            // num-resume math itself is subtly wrong (likely the keystream
+            // reconstruction doesn't actually match OpenSSL's in-place ivec
+            // layout). Forcing _idx=0 means our next ProcessBytes call will
+            // freshly encrypt _feedback to produce a clean keystream block —
+            // which is correct ONLY if the client's next BF_cfb64 call also
+            // starts at num=0. If the client is mid-block, we'll be off; if
+            // it's at a block boundary, we align.
+            _idx = 0;
         }
 
         // Copy the current CFB state (IV and byte index within the keystream
