@@ -1501,10 +1501,12 @@ namespace ConquerRevObserver
             }
 
             ulong data = enable ? (1UL << ProxyMain.InjectEffectBit) : 0UL;
-            // 44 bytes total: 4 header + 32 body + 8 trailer. Body matches
-            // the size of real Rev 5517 MsgUserAttrib (#10017) packets seen
-            // on the wire.
-            var pkt = new byte[44];
+            // 32 bytes total: 4 header + 20 body + 8 trailer. Matches the
+            // 5065 PoC's working shape — server-observed packets are 44
+            // bytes but the 5065 PoC proved a 32-byte fake renders the
+            // visual without crashing the client. The 44-byte attempt
+            // crashed; try the proven shape first.
+            var pkt = new byte[32];
             fixed (byte* ptr = pkt)
             {
                 *((ushort*)ptr) = (ushort)(pkt.Length - 8);
@@ -1513,9 +1515,6 @@ namespace ConquerRevObserver
                 *((uint*)(ptr + 8)) = 1;
                 *((uint*)(ptr + 12)) = ConquerPoc.Constants.UPDATE_TYPE_STATUS_EFFECTS;
                 *((ulong*)(ptr + 16)) = data;
-                // [24..35] already zero. The 12 trailing body bytes are
-                // unknown — we'll need to capture a real Update(StatusEffects)
-                // for this build to find out what (if anything) goes here.
             }
             // Trailer (the client validates this).
             var seal = System.Text.Encoding.ASCII.GetBytes("TQServer");
@@ -1568,7 +1567,7 @@ namespace ConquerRevObserver
             {
                 _cs.Write(pkt, 0, pkt.Length);
                 ProxyMain.Log("inject", $"sent fake UpdatePacket(StatusEffects=0x{data:X16}, bit={ProxyMain.InjectEffectBit}) to client UID={targetUid}");
-                ProxyMain.Log("inject", "post-inject: client's s->c IV is now 44 bytes ahead of server's; subsequent real bytes will garble. Session is effectively hosed.");
+                ProxyMain.Log("inject", $"post-inject: client's s->c IV is now {pkt.Length} bytes ahead of server's; subsequent real bytes will garble. Session is effectively hosed.");
             }
             catch (Exception e)
             {
