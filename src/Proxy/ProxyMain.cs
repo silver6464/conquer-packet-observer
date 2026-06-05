@@ -1020,14 +1020,23 @@ namespace ConquerRevObserver
             }
         }
 
-        // s->c: decrypt with upstream cipher (which the *server* uses to
-        // encrypt outbound), walk packets, re-encrypt with downstream cipher
-        // (which the *client* expects), forward to client.
+        // HYBRID MODE: s->c is observe-only at the wire level. We decrypt a
+        // copy of the chunk for logging, but FORWARD THE ORIGINAL CIPHERTEXT
+        // UNMODIFIED to the client. The client's s->c-decrypt cipher state
+        // and the server's s->c-encrypt cipher state stay locked to each
+        // other naturally — the proxy stays out of the loop.
+        //
+        // To enable one-shot injection later, we also feed the same wire
+        // ciphertext through a "mirror" cipher (_downstreamGameCipher's
+        // s2c-decrypt engine, used here in decrypt mode purely to track
+        // CFB IV evolution). At injection time we'll clone the mirror's
+        // state into a separate injector cipher.
         private void ActiveProcessS2c(byte[] chunk)
         {
             if (_upstreamGameCipher == null || _downstreamGameCipher == null) return;
 
-            // Decrypt copy for logging.
+            // Decrypt copy for logging via the upstream cipher (mirrors the
+            // server's s->c-encrypt IV evolution).
             byte[] plaintext;
             lock (_activeUpstreamLock)
             {
@@ -1036,16 +1045,19 @@ namespace ConquerRevObserver
             }
             WalkPackets(plaintext, "s->c");
 
-            // Re-encrypt the SAME plaintext with the downstream cipher and
-            // write to client. EncryptS2c specifically uses the s2c-engine
-            // in encrypt direction (the same engine downstream's DecryptS2c
-            // is NOT — they're separate per-direction streams).
+            // Mirror: feed the same ciphertext through the downstream s2c
+            // engine in DECRYPT mode (we discard the output). This evolves
+            // the downstream s2c engine's IV identically to the client's
+            // s->c-decrypt cipher, so when we later inject a fake packet,
+            // we encrypt at the correct CFB position.
             lock (_activeDownstreamLock)
             {
-                var outbound = (byte[])plaintext.Clone();
-                _downstreamGameCipher.EncryptS2c(outbound);
-                try { _cs.Write(outbound, 0, outbound.Length); } catch { return; }
+                var mirrorScratch = (byte[])chunk.Clone();
+                _downstreamGameCipher.DecryptS2c(mirrorScratch);
             }
+
+            // Forward the original ciphertext to the client unmodified.
+            try { _cs.Write(chunk, 0, chunk.Length); } catch { return; }
         }
 
         // c->s: decrypt with downstream cipher (which the *client* uses to
@@ -1316,9 +1328,9 @@ namespace ConquerRevObserver
         /// </summary>
         private unsafe void SendFakeCycloneToClient(bool enable)
         {
-            if (_downstreamGameCipher == null)
+            if (_downstreamGameCipher == null || _activeKeyState == null)
             {
-                ProxyMain.Log("inject", "WARN: downstream cipher not ready; cannot inject");
+                ProxyMain.Log("inject", "WARN: ciphers not ready; cannot inject");
                 return;
             }
             ulong data = enable ? ConquerPoc.Constants.CLIENT_EFFECT_CYCLONE : 0UL;
@@ -1333,13 +1345,11 @@ namespace ConquerRevObserver
                 *((uint*)(ptr + 8)) = 1;
                 *((uint*)(ptr + 12)) = ConquerPoc.Constants.UPDATE_TYPE_STATUS_EFFECTS;
                 *((ulong*)(ptr + 16)) = data;
-                // [24..35] already zero (default array init). If 5517 needs
-                // specific values here, we'll see the visual still not render
-                // and need to dump a real Update for the same updateType
-                // value to copy the byte pattern.
+                // [24..35] already zero. If the 5187 server expects specific
+                // values in those 12 bytes, we'll need to capture a real
+                // Update(StatusEffects) packet first and copy the pattern.
             }
-            // Trailer (the client validates this; without it, the client
-            // closes the TCP connection).
+            // Trailer (the client validates this).
             var seal = System.Text.Encoding.ASCII.GetBytes("TQServer");
             Buffer.BlockCopy(seal, 0, pkt, pkt.Length - 8, 8);
 
@@ -1348,23 +1358,53 @@ namespace ConquerRevObserver
             for (int i = 0; i < pkt.Length; i++) hex.Append(pkt[i].ToString("X2")).Append(' ');
             ProxyMain.Log("inject", $"fake StatusEffects pkt plaintext: {hex}");
 
-            // Encrypt with the downstream cipher's s2c-encrypt engine and
-            // write to client. The downstream s2c-encrypt CFB state advances
-            // by 32 bytes — those same 32 ciphertext bytes also advance the
-            // client's own s2c-decrypt CFB state when it reads them off the
-            // socket, so the streams stay in lockstep.
-            lock (_activeDownstreamLock)
+            // Build a fresh "injector" cipher whose schedule is the captured
+            // game key. Clone the current s2c-decrypt CFB state from the
+            // mirror (_downstreamGameCipher) into it — the mirror's IV
+            // tracks the client's s->c-decrypt IV because we've been feeding
+            // every real server byte through it in decrypt mode.
+            //
+            // Encrypt the fake packet with the injector. The output is
+            // ciphertext that will decrypt cleanly on the client at its
+            // current IV.
+            //
+            // IMPORTANT: after this injection, the client's s->c-decrypt IV
+            // has advanced by 44 bytes processing our fake. The server's
+            // s->c-encrypt IV has NOT advanced (server didn't send anything).
+            // The streams are now misaligned and all future real server
+            // bytes will decrypt to garbage on the client. The session is
+            // effectively hosed after one injection. This is acceptable for
+            // a one-shot "yes, the visual renders" test.
+            var injector = new GameCryptography(new byte[] { 0 });
+            try
             {
-                _downstreamGameCipher.EncryptS2c(pkt);
-                try
+                string keyPath = FindLoadedKeyfilePath();
+                if (keyPath == null) { ProxyMain.Log("inject", "WARN: keyfile path lost; cannot inject"); return; }
+                var fresh = GameKeyState.LoadFrom(keyPath);
+                // The injector's s2c-decrypt engine has the captured schedule
+                // (from LoadSchedules) with IV=0. Overlay the mirror's CFB
+                // state on top so it picks up where the client is now.
+                lock (_activeDownstreamLock)
                 {
-                    _cs.Write(pkt, 0, pkt.Length);
-                    ProxyMain.Log("inject", $"sent fake UpdatePacket(StatusEffects=0x{data:X16}) to client UID={_activePlayerUid}");
+                    _downstreamGameCipher.CopyS2cStateInto(fresh.Crypto);
                 }
-                catch (Exception e)
-                {
-                    ProxyMain.Log("inject", $"failed to send fake packet: {e.Message}");
-                }
+                fresh.Crypto.EncryptS2c(pkt);
+            }
+            catch (Exception e)
+            {
+                ProxyMain.Log("inject", $"failed to build injector: {e.Message}");
+                return;
+            }
+
+            try
+            {
+                _cs.Write(pkt, 0, pkt.Length);
+                ProxyMain.Log("inject", $"sent fake UpdatePacket(StatusEffects=0x{data:X16}) to client UID={_activePlayerUid}");
+                ProxyMain.Log("inject", "post-inject: client's s->c IV is now 44 bytes ahead of server's; subsequent real bytes will garble. Session is effectively hosed.");
+            }
+            catch (Exception e)
+            {
+                ProxyMain.Log("inject", $"failed to send fake packet: {e.Message}");
             }
         }
 

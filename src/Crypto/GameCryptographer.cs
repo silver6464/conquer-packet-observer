@@ -96,6 +96,17 @@ namespace ConquerPoc.Cryptography
             _decrypt.ProcessBytes(slice, false);
             System.Buffer.BlockCopy(slice, 0, packet, offset, count);
         }
+
+        // Clone our s2c-engine's CFB state (IV, idx, keystream cache) into
+        // another GameCryptography's s2c engine. Used by the active-MitM
+        // hybrid: a "mirror" cipher tracks the client's s2c-decrypt state by
+        // running every s2c byte through it, and at injection time we copy
+        // that state into a fresh "injector" cipher to encrypt one fake
+        // packet at the correct point in the cipher stream.
+        public void CopyS2cStateInto(GameCryptography dest)
+        {
+            this._decrypt.CopyCfbStateInto(dest._decrypt);
+        }
     }
 
     /// <summary>
@@ -127,6 +138,20 @@ namespace ConquerPoc.Cryptography
             _engine.LoadSchedule(p, s);
             System.Array.Copy(iv, _feedback, 8);
             _idx = 0;
+        }
+
+        // Copy the current CFB state (IV and byte index within the keystream
+        // block) into another engine. The other engine's BLOWFISH SCHEDULE
+        // must already be loaded; only the CFB-side state (IV + idx +
+        // keystream cache) is updated. Used by the active-MitM injection
+        // path: take a "mirror" engine's current state and clone it into a
+        // separate "injector" engine that will encrypt one fake packet
+        // without disturbing the mirror.
+        public void CopyCfbStateInto(BlowfishCfb64 dest)
+        {
+            System.Array.Copy(this._feedback, dest._feedback, 8);
+            System.Array.Copy(this._keystream, dest._keystream, 8);
+            dest._idx = this._idx;
         }
 
         public void ProcessBytes(byte[] data, bool encrypting)
