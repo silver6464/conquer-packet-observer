@@ -60,6 +60,25 @@ namespace ConquerPoc.Cryptography
             _decrypt.ProcessBytes(packet, false);
         }
 
+        // Active-MitM encrypters. The c2s engine and s2c engine are independent
+        // CFB streams; calling encrypt on one advances ONLY that stream's IV.
+        // EncryptC2s: encrypt a plaintext c->s packet for upstream forwarding
+        // (the proxy is acting as the client toward the server).
+        // EncryptS2c: encrypt a plaintext s->c packet for downstream forwarding
+        // (the proxy is acting as the server toward the client). The generic
+        // Encrypt() above is identical to EncryptS2c — it uses the _encrypt
+        // engine. We keep both names so call sites read like the wire
+        // direction.
+        public void EncryptC2s(byte[] packet)
+        {
+            _encrypt.ProcessBytes(packet, true);
+        }
+
+        public void EncryptS2c(byte[] packet)
+        {
+            _decrypt.ProcessBytes(packet, true);
+        }
+
         // Decrypt a slice in place (offset, count) — used when we need to
         // decrypt only part of a chunk through one of the engines.
         public void DecryptC2sSlice(byte[] packet, int offset, int count)
