@@ -1318,20 +1318,23 @@ namespace ConquerRevObserver
             string m = message.Trim();
             if (m.Equals("@cyclone", StringComparison.OrdinalIgnoreCase))
             {
-                if (_activePlayerUid == 0)
+                // Either auto-detected UID OR the --player-uid override is
+                // enough to fire the inject. SendFakeCycloneToClient will
+                // do its own no-uid check if both are zero.
+                if (_activePlayerUid == 0 && ProxyMain.OverridePlayerUid == 0)
                 {
-                    ProxyMain.Log("inject", "@cyclone: player UID not yet known; skipping injection");
+                    ProxyMain.Log("inject", "@cyclone: no player UID known (auto-detect missed, no --player-uid override); skipping");
                     return;
                 }
                 if (_activeCycloneActive)
                 {
-                    ProxyMain.Log("inject", "@cyclone: clearing fake StatusEffects (off)");
+                    ProxyMain.Log("inject", $"@cyclone: clearing fake StatusEffects (off, bit={ProxyMain.InjectEffectBit})");
                     SendFakeCycloneToClient(false);
                     _activeCycloneActive = false;
                 }
                 else
                 {
-                    ProxyMain.Log("inject", "@cyclone: arming fake StatusEffects bit23 (on)");
+                    ProxyMain.Log("inject", $"@cyclone: arming fake StatusEffects (on, bit={ProxyMain.InjectEffectBit})");
                     SendFakeCycloneToClient(true);
                     _activeCycloneActive = true;
                 }
