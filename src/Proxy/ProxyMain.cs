@@ -857,12 +857,8 @@ namespace ConquerRevObserver
                         ProxyMain.Log("pkt", $"{dir} type={type} total={total} [malformed, stop walking]");
                         return;
                     }
-                    // Hex dump the first 32 bytes (or full packet if shorter) for new packet types.
-                    int dumpLen = Math.Min(total, 64);
-                    var sb = new StringBuilder();
-                    for (int i = 0; i < dumpLen; i++)
-                        sb.Append(chunk[offset + i].ToString("X2")).Append(' ');
-                    ProxyMain.Log("pkt", $"{dir} type={type,4} size={total,4}  {sb}{(total > dumpLen ? "..." : "")}");
+                    string formatted = ConquerPoc.Packets.PacketPrinter.Format(chunk, offset, total, type);
+                    ProxyMain.Log("pkt", $"{dir} {formatted}");
                     offset += total;
                 }
             }

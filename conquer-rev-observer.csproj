@@ -13,4 +13,13 @@
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
   </ItemGroup>
 
+  <!-- conquer-poc/ is a separate, sibling project that lives inside this tree
+       for convenience (shared crypto/parsing reference). It must not be compiled
+       into the observer or namespace collisions occur. -->
+  <ItemGroup>
+    <Compile Remove="conquer-poc/**" />
+    <Compile Remove="bin/**" />
+    <Compile Remove="obj/**" />
+  </ItemGroup>
+
 </Project>

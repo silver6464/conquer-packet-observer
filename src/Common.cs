@@ -31,6 +31,9 @@ namespace ConquerPoc
 
     public static class Constants
     {
+        // 5065 (legacy) packet type IDs. Some carry over unchanged to Rev's
+        // 5517 build (Talk, Interact, Connect, HeroInformation, ServerTime);
+        // others were renumbered into the 10000s range (see Constants5517).
         public const ushort MSG_INTERACT = 1022;
         public const ushort MSG_WALK = 1005;
         public const ushort MSG_TALK = 1004;
@@ -49,5 +52,27 @@ namespace ConquerPoc
 
         // ClientEffect bitmask values from Redux/Enum/ClientEffect.cs
         public const ulong CLIENT_EFFECT_CYCLONE = 1UL << 23;
+    }
+
+    /// <summary>
+    /// Packet type IDs observed on the Rev 5517 server. Some packet shapes
+    /// match 5065 layouts under new IDs — those are flagged as candidates
+    /// for "best-effort" parsing in PacketPrinter, NOT confirmed mappings.
+    /// </summary>
+    public static class Constants5517
+    {
+        // Best-effort mapping from observed packet shapes. Each one is a
+        // hypothesis: the body shape matches the same-name 5065 layout.
+        // Verify before depending on these for anything beyond labeling.
+        public const ushort MSG_WALK_LIKE        = 10005;
+        public const ushort MSG_ACTION_LIKE      = 10010;
+        public const ushort MSG_SPAWN_ENTITY_LIKE = 10014;
+        public const ushort MSG_UPDATE_LIKE      = 10017;
+
+        // Rev-specific / not in 5065. type=2685 is consistently large
+        // (763 bytes) with mostly-zero body and ASCII hex blob at the start.
+        // Strongly suspected to be an anti-cheat (SecurePlay) report; we
+        // label and skip its body parse.
+        public const ushort MSG_AC_REPORT = 2685;
     }
 }

@@ -8,6 +8,18 @@ using ConquerPoc.Packets;
 
 namespace ConquerPoc.Packets.Game
 {
+    // InteractPacket: covers MSG_INTERACT (1022) — combat actions, spell casts,
+    // social interactions, etc. See InteractAction enum for the full action list.
+    //
+    // SCOPE NOTE — Phase 1 (current observer): only the read/decode methods are
+    // wired up. The `byte* ->` cast and DecodeMagicAttack are called by the
+    // packet pretty-printer to render `c->s type=1022 Interact { ... }` lines.
+    //
+    // The write/encode methods (Create, the `byte[]` operator, EncodeMagicAttack)
+    // exist for Phase 2 — controlled, manually-triggered injection tests that
+    // verify whether forged Interact packets are still accepted by the Rev 5517
+    // server (security regression check on operator-owned infrastructure). They
+    // are intentionally NOT called from the observer's normal packet pumps.
     public unsafe struct InteractPacket
     {
         public uint Timestamp;
