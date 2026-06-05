@@ -434,7 +434,6 @@ namespace ConquerRevObserver
 
         // c->s key-transition state.
         private GameCryptography _c2sLoginCipher;   // DR654, lazily created
-        private int _c2sLoginBytesRemaining = -1;   // -1 = haven't parsed auth length yet
         private bool _c2sGameKeyActive;             // once true, c->s uses game key
 
         private void DrainAndDecrypt(GameKeyState state, bool isServerToClient, byte[] freshChunk, string tag)
@@ -919,7 +918,6 @@ namespace ConquerRevObserver
         // handshake packet. If yes, log loudly with the destination IP+port — that's
         // a Conquer-protocol stream hiding under a non-standard port/IP.
         private long _s2cBytes, _c2sBytes;
-        private bool _firstS2cChecked, _firstC2sChecked;
 
         private void BridgeRaw()
         {
