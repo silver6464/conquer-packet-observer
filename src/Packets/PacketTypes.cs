@@ -3,83 +3,143 @@ using System.Collections.Generic;
 namespace ConquerPoc.Packets
 {
     /// <summary>
-    /// Packet-type registry. Two tables: 5065 IDs (the source we ported from)
-    /// and Rev's 5517 IDs (some carried over, some renumbered into the 10000s).
+    /// Packet-type registry. Names are sourced from the canonical Conquer
+    /// Online wiki ([Packets/Packets.md] in conquer-wiki), cross-checked
+    /// against the Comet 5187 server source's PacketType enum.
     ///
-    /// Resolution order: look up by ID in 5065 table first (it has the well-known
-    /// names). If not found, try 5517 table. If still not found, return
-    /// "Unknown#N" so we can spot novel packet types in the log and add them.
-    ///
-    /// Both name lookups return a *display name* and an *era tag* that tells the
-    /// printer how confident we are. 5065-era names are reliable. 5517-era names
-    /// are best-effort guesses based on observed body shapes — they get a "?"
-    /// suffix in the output so we never imply more certainty than we have.
+    /// Some IDs have two valid names — a "current" name used in the Comet
+    /// 5187 source and an older "5065-era" name used in Redux. We use the
+    /// wiki name (which generally matches Comet 5187) so logs read like
+    /// the documentation. The lookup also stores a short tag for packets
+    /// where the wire layout differs across patches.
     /// </summary>
     public static class PacketTypes
     {
-        public enum Era { Known5065, Candidate5517, Unknown }
-
         public sealed class Entry
         {
             public ushort Id;
             public string Name;
-            public Era Era;
+            // Brief layout tag (e.g. "patch5165"). Empty when not relevant.
+            public string Layout;
         }
 
-        // Known 5065 packet types. Source: filenames in proj/conquer-redux-5065/
-        //   Redux/Packets/{Game,Login}/.
-        private static readonly Dictionary<ushort, string> NAMES_5065 = new Dictionary<ushort, string>
+        // Wiki-canonical names. Source: conquer-wiki/Packets/Packets.md.
+        // Where multiple wiki patch versions exist for the same ID, the
+        // Layout field flags the one we expect on Rev 5187 (closest match
+        // wins on body-size).
+        private static readonly Dictionary<ushort, Entry> KNOWN = new Dictionary<ushort, Entry>
         {
-            { 1001, "Register" },         { 1004, "Talk" },              { 1005, "Walk" },
-            { 1006, "HeroInformation" },  { 1008, "ItemInformation" },   { 1009, "ItemAction" },
-            { 1010, "GeneralData" },      { 1012, "AccountSpawn" },      { 1014, "SpawnEntity" },
-            { 1015, "Strings" },          { 1017, "Update" },            { 1019, "Associate" },
-            { 1022, "Interact" },
-            { 1023, "TeamInteraction" },  { 1024, "AssignAttributes" },  { 1025, "WeaponProf" },
-            { 1026, "TeamMemberInfo" },   { 1027, "SocketGem" },         { 1032, "Action2" },
-            { 1033, "ServerTime" },       { 1052, "Connect" },           { 1055, "AuthResponse" },
-            { 1056, "PasswordSeed" },     { 1058, "GuildDonation" },     { 1086, "Account" },
-            { 1100, "MacAddress" },       { 1101, "GroundItem" },        { 1102, "Warehouse" },
-            { 1103, "ConquerSkill" },     { 1105, "SkillEffect" },       { 1106, "GuildAttrInfo" },
-            { 1107, "Guild" },            { 1108, "VendorItem" },        { 1109, "SobSpawn" },
-            { 1110, "MapStatus" },        { 1112, "GuildMemberInfo" },   { 1128, "MsgUserAttrib" },
-            { 1134, "MsgUserItems" },
-            { 2030, "SpawnNpc" },         { 2031, "Npc" },               { 2032, "NpcDialog" },
-            { 2033, "AssociateInfo" },    { 2036, "Compose" },           { 2043, "OfflineTGInfo" },
-            { 2044, "OfflineTG" },        { 2048, "MsgUserInfoEx" },     { 2050, "Broadcast" },
-            { 2064, "Nobility" },         { 2065, "MentorAction" },      { 2066, "MentorInformation" },
-            { 2067, "MentorPrize" },
-        };
+            { 1001, new Entry { Id=1001, Name="MsgRegister" } },
+            { 1004, new Entry { Id=1004, Name="MsgTalk" } },
+            { 1005, new Entry { Id=1005, Name="MsgWalk" } },              // old; renumbered to 10005 in Rev
+            { 1006, new Entry { Id=1006, Name="MsgUserInfo", Layout="patch5165" } },
+            { 1008, new Entry { Id=1008, Name="MsgItemInfo" } },
+            { 1009, new Entry { Id=1009, Name="MsgItem" } },
+            { 1010, new Entry { Id=1010, Name="MsgAction" } },             // old; renumbered to 10010
+            { 1012, new Entry { Id=1012, Name="MsgTick" } },               // was wrongly "AccountSpawn" before
+            { 1014, new Entry { Id=1014, Name="MsgPlayer" } },             // old; renumbered to 10014
+            { 1015, new Entry { Id=1015, Name="MsgName" } },
+            { 1016, new Entry { Id=1016, Name="MsgWeather" } },
+            { 1017, new Entry { Id=1017, Name="MsgUserAttrib" } },         // old; renumbered to 10017
+            { 1019, new Entry { Id=1019, Name="MsgFriend" } },
+            { 1022, new Entry { Id=1022, Name="MsgInteract", Layout="patch5017" } },
+            { 1023, new Entry { Id=1023, Name="MsgTeam" } },
+            { 1024, new Entry { Id=1024, Name="MsgAllot" } },
+            { 1025, new Entry { Id=1025, Name="MsgWeaponSkill" } },
+            { 1026, new Entry { Id=1026, Name="MsgTeamMember" } },
+            { 1027, new Entry { Id=1027, Name="MsgGemEmbed" } },
+            { 1028, new Entry { Id=1028, Name="MsgFuse" } },
+            { 1032, new Entry { Id=1032, Name="MsgBattleEffectiveness" } },
+            { 1033, new Entry { Id=1033, Name="MsgData" } },
+            { 1034, new Entry { Id=1034, Name="MsgDetainItemInfo" } },
+            { 1036, new Entry { Id=1036, Name="MsgGodExp" } },
+            { 1037, new Entry { Id=1037, Name="MsgPing" } },
+            { 1041, new Entry { Id=1041, Name="MsgEnemyList" } },
+            { 1052, new Entry { Id=1052, Name="MsgConnect", Layout="patch5615" } },
+            { 1055, new Entry { Id=1055, Name="MsgConnectEx" } },
+            { 1056, new Entry { Id=1056, Name="MsgTrade" } },
+            { 1058, new Entry { Id=1058, Name="MsgSynpOffer" } },
+            { 1059, new Entry { Id=1059, Name="MsgEncryptCode" } },
+            { 1086, new Entry { Id=1086, Name="MsgAccount" } },
+            { 1100, new Entry { Id=1100, Name="MsgPCNum" } },
+            { 1101, new Entry { Id=1101, Name="MsgMapItem" } },
+            { 1102, new Entry { Id=1102, Name="MsgPackage" } },
+            { 1103, new Entry { Id=1103, Name="MsgMagicInfo" } },
+            { 1104, new Entry { Id=1104, Name="MsgFlushExp" } },
+            { 1105, new Entry { Id=1105, Name="MsgMagicEffect" } },
+            { 1106, new Entry { Id=1106, Name="MsgSyndicateAttributeInfo" } },
+            { 1107, new Entry { Id=1107, Name="MsgSyndicate" } },
+            { 1108, new Entry { Id=1108, Name="MsgItemInfoEx" } },
+            { 1109, new Entry { Id=1109, Name="MsgNpcInfoEx" } },
+            { 1110, new Entry { Id=1110, Name="MsgMapInfo" } },
+            { 1111, new Entry { Id=1111, Name="MsgMessageBoard" } },
+            { 1112, new Entry { Id=1112, Name="MsgSynMemberInfo" } },
+            { 1113, new Entry { Id=1113, Name="MsgDice" } },
+            { 1114, new Entry { Id=1114, Name="MsgSyncAction" } },
+            { 1128, new Entry { Id=1128, Name="MsgVipUserHandle" } },     // not MsgUserAttrib (which is 1017/10017)
+            { 1129, new Entry { Id=1129, Name="MsgVipFunctionValidNotify" } },
+            { 1130, new Entry { Id=1130, Name="MsgTitle" } },
+            { 1134, new Entry { Id=1134, Name="MsgTaskStatus" } },         // not MsgUserItems
+            { 1135, new Entry { Id=1135, Name="MsgTaskDetailInfo" } },
+            { 1136, new Entry { Id=1136, Name="MsgAchievement" } },
+            { 1150, new Entry { Id=1150, Name="MsgFlower" } },
+            { 1151, new Entry { Id=1151, Name="MsgRank" } },
+            { 1213, new Entry { Id=1213, Name="MsgLoginChallengeS" } },
+            { 1214, new Entry { Id=1214, Name="MsgLoginProofC" } },
+            { 1312, new Entry { Id=1312, Name="MsgFamily" } },
+            { 1313, new Entry { Id=1313, Name="MsgFamilyOccupy" } },
+            { 1350, new Entry { Id=1350, Name="MsgGameServerShutDown" } },
+            { 2030, new Entry { Id=2030, Name="MsgNpcInfo" } },             // formerly "SpawnNpc"
+            { 2031, new Entry { Id=2031, Name="MsgNpc" } },
+            { 2032, new Entry { Id=2032, Name="MsgTaskDialog" } },
+            { 2033, new Entry { Id=2033, Name="MsgFriendInfo" } },
+            { 2036, new Entry { Id=2036, Name="MsgDataArray" } },
+            { 2041, new Entry { Id=2041, Name="MsgAnnounceList" } },
+            { 2042, new Entry { Id=2042, Name="MsgAnnounceInfo" } },
+            { 2043, new Entry { Id=2043, Name="MsgTrainingInfo" } },
+            { 2044, new Entry { Id=2044, Name="MsgTraining" } },
+            { 2046, new Entry { Id=2046, Name="MsgTradeBuddy" } },
+            { 2047, new Entry { Id=2047, Name="MsgTradeBuddyInfo" } },
+            { 2048, new Entry { Id=2048, Name="MsgEquipLock" } },           // not MsgUserInfoEx
+            { 2050, new Entry { Id=2050, Name="MsgPigeon" } },
+            { 2051, new Entry { Id=2051, Name="MsgPigeonQuery" } },
+            { 2064, new Entry { Id=2064, Name="MsgPeerage" } },             // formerly "Nobility" — same thing
+            { 2065, new Entry { Id=2065, Name="MsgGuide" } },
+            { 2066, new Entry { Id=2066, Name="MsgGuideInfo" } },
+            { 2067, new Entry { Id=2067, Name="MsgContribute" } },
+            { 2068, new Entry { Id=2068, Name="MsgQuiz" } },
+            { 2070, new Entry { Id=2070, Name="MsgSuitStatus" } },
+            { 2071, new Entry { Id=2071, Name="MsgRelation" } },
+            { 2078, new Entry { Id=2078, Name="MsgUserIPInfo" } },
+            { 2079, new Entry { Id=2079, Name="MsgServerInfo" } },
+            { 2080, new Entry { Id=2080, Name="MsgChangeName" } },
+            { 2081, new Entry { Id=2081, Name="MsgDeadMark" } },
+            { 2110, new Entry { Id=2110, Name="MsgSuperFlag" } },
+            { 2225, new Entry { Id=2225, Name="MsgSynRecruitAdvertising" } },
+            { 2227, new Entry { Id=2227, Name="MsgSynRecruitAdvertisingOpt" } },
+            { 2286, new Entry { Id=2286, Name="MsgMapItem" } },
+            { 2430, new Entry { Id=2430, Name="MsgNationality" } },
+            { 2501, new Entry { Id=2501, Name="MsgCrossSwitch" } },
 
-        // Rev 5517 packet types. Empirically observed in proxy logs. Treat these
-        // as candidates — the *name* is a best-effort guess that the body shape
-        // matches the same-name 5065 layout. Verify by parsing and eyeballing.
-        private static readonly Dictionary<ushort, string> NAMES_5517 = new Dictionary<ushort, string>
-        {
-            { 10005, "Walk" },       // ~24-byte body, looks like a uid+counter pattern
-            { 10010, "GeneralData" }, // ~36/40-byte body, contains uid + position data
-            { 10014, "SpawnEntity" }, // ~150+ byte body matching SpawnEntity scale
-            { 10017, "Update" },     // ~44-byte body, fits Update layout
-            // Rev-specific anti-cheat packet: large (763 bytes), high zero-padding,
-            // ASCII hex blob at start. Not a gameplay packet.
-            { 2685, "ACReport" },
+            // Rev-specific anti-cheat packet. Large (763 bytes), high zero-
+            // padding, ASCII hex blob at start. Not a gameplay packet.
+            { 2685, new Entry { Id=2685, Name="MsgACReport" } },
+
+            // Renumbered IDs on Rev 5187 (also patch 5103 era per the wiki).
+            // Body layouts match their 1000s-range counterparts at the same
+            // patch level.
+            { 10005, new Entry { Id=10005, Name="MsgWalk" } },
+            { 10010, new Entry { Id=10010, Name="MsgAction", Layout="patch5517" } },
+            { 10014, new Entry { Id=10014, Name="MsgPlayer" } },
+            { 10017, new Entry { Id=10017, Name="MsgUserAttrib", Layout="patch5672" } },
         };
 
         public static Entry Lookup(ushort id)
         {
-            if (NAMES_5065.TryGetValue(id, out var n5065))
-                return new Entry { Id = id, Name = n5065, Era = Era.Known5065 };
-            if (NAMES_5517.TryGetValue(id, out var n5517))
-                return new Entry { Id = id, Name = n5517, Era = Era.Candidate5517 };
-            return new Entry { Id = id, Name = $"Unknown#{id}", Era = Era.Unknown };
+            if (KNOWN.TryGetValue(id, out var e)) return e;
+            return new Entry { Id = id, Name = $"Unknown#{id}" };
         }
 
-        // Display label including era marker. 5065 names are unmodified. 5517
-        // candidates get a "?" suffix to flag uncertainty.
-        public static string Label(ushort id)
-        {
-            var e = Lookup(id);
-            return e.Era == Era.Candidate5517 ? e.Name + "?" : e.Name;
-        }
+        public static string Label(ushort id) => Lookup(id).Name;
     }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using ConquerPoc.Enum;
 using ConquerPoc.Packets.Game;
@@ -59,22 +60,29 @@ namespace ConquerPoc.Packets
             {
                 case 1004: return ParseTalk(chunk, bodyStart, bodyLen);
                 case 1005: return ParseWalk5065(chunk, bodyStart, bodyLen);
-                // 10005 Walk body layout on Rev 5517 is NOT the same as 5065
-                // (5065 expected uid:u32 dir:u8 mode:u8 at body offset 0,
-                // but Rev 5517 puts something else there — the values we
-                // read as dir/mode are out of range). Parking parsing
-                // until we figure out the real layout; fall through to hex.
+                // 10005 Walk body layout on Rev 5517 isn't fully nailed down.
+                // Leave it to the hex fallback; we get the type label right
+                // from the registry.
                 case 10005: return null;
+                case 1006: return ParseUserInfo(chunk, bodyStart, bodyLen);
+                case 1008: return ParseItemInfo(chunk, bodyStart, bodyLen);
+                case 1009: return ParseItem(chunk, bodyStart, bodyLen);
                 case 1010:
-                case 10010: return ParseGeneralData(chunk, bodyStart, bodyLen);
+                case 10010: return ParseAction(chunk, bodyStart, bodyLen);
+                case 1012: return ParseTick(chunk, bodyStart, bodyLen);
                 case 1014:
-                case 10014: return ParseSpawnEntity(chunk, bodyStart, bodyLen);
+                case 10014: return ParsePlayer(chunk, bodyStart, bodyLen);
                 case 1017:
-                case 10017: return ParseUpdate(chunk, bodyStart, bodyLen);
+                case 10017: return ParseUserAttrib(chunk, bodyStart, bodyLen);
                 case 1022: return ParseInteract(chunk, off, total);
-                case 1033: return ParseServerTime(chunk, bodyStart, bodyLen);
+                case 1025: return ParseWeaponSkill(chunk, bodyStart, bodyLen);
+                case 1033: return ParseData(chunk, bodyStart, bodyLen);
                 case 1052: return ParseConnect(chunk, bodyStart, bodyLen);
-                case 1110: return ParseMapStatus(chunk, bodyStart, bodyLen);
+                case 1101: return ParseMapItem(chunk, bodyStart, bodyLen);
+                case 1110: return ParseMapInfo(chunk, bodyStart, bodyLen);
+                case 2030: return ParseNpcInfo(chunk, bodyStart, bodyLen);
+                case 2032: return ParseTaskDialog(chunk, bodyStart, bodyLen);
+                case 2064: return ParsePeerage(chunk, bodyStart, bodyLen);
                 case 2685: return $"{{ ac-report, body={bodyLen}b }}";
             }
             return null;
@@ -110,74 +118,75 @@ namespace ConquerPoc.Packets
             return $"{{ uid={uid} dir={dir} mode={mode} }}";
         }
 
-        // MSG_ACTION/GeneralData (1010 / 10010): widely variable layout depending on action.
-        // Common fields we can identify: uid at offset 4-7, action at offset 18-19, x/y often at 12-15.
-        private static string ParseGeneralData(byte[] b, int off, int len)
+        // MsgAction (1010 / 10010): generic request/response. Patch 5517
+        // layout per conquer-wiki: CharacterID:u32 Command:u32 Args[2]:u16
+        // Timestamp:u32 Action:u16 Direction:u16 X:u16 Y:u16 Map:u32 Color:u32.
+        // We show the most useful fields and the action name.
+        private static string ParseAction(byte[] b, int off, int len)
         {
-            if (len < 16) return null;
-            uint uid = ReadU32(b, off + 4);
-            ushort act = len >= 20 ? (ushort)ReadU16(b, off + 18) : (ushort)0;
-            ushort x   = len >= 14 ? (ushort)ReadU16(b, off + 12) : (ushort)0;
-            ushort y   = len >= 16 ? (ushort)ReadU16(b, off + 14) : (ushort)0;
-            return $"{{ uid={uid} act={act} pos=({x},{y}) }}";
+            if (len < 28) return null;
+            uint chrId = ReadU32(b, off);
+            uint cmd   = ReadU32(b, off + 4);
+            uint ts    = ReadU32(b, off + 12);
+            ushort act = (ushort)ReadU16(b, off + 16);
+            ushort dir = (ushort)ReadU16(b, off + 18);
+            ushort x   = (ushort)ReadU16(b, off + 20);
+            ushort y   = (ushort)ReadU16(b, off + 22);
+            return $"{{ chr={chrId} cmd={cmd} ts={ts} action={ActionName(act)}({act}) dir={dir} pos=({x},{y}) }}";
         }
 
-        // MSG_SPAWN_ENTITY (1014 / 10014): big variable struct. Just show the head UID.
-        private static string ParseSpawnEntity(byte[] b, int off, int len)
-        {
-            if (len < 4) return null;
-            uint uid = ReadU32(b, off);
-            return $"{{ uid={uid} body={len}b }}";
-        }
-
-        // MSG_UPDATE (1017 / 10017): uid:u32 at 4-7, count:u32 at 8-11,
-        // updateType:u32 at 12-15, data:u64 at 16-23. Rev 5517 has 12 extra
-        // bytes of body we don't yet understand — show their hex so we
-        // can reverse-engineer the layout from observed packets.
-        //
-        // When data != 0 we ALSO dump the entire body as a hex blob and
-        // tag the bit positions set in `data`. The latter lets us spot
-        // which status-effect bits a real packet sets (per the live
-        // statuseffect.ini bit-shift mapping).
-        private static string ParseUpdate(byte[] b, int off, int len)
+        // MsgPlayer (1014 / 10014): spawn-entity, ~140-byte variable body.
+        // Wiki has the full struct; for now just surface the leading UID +
+        // mesh/look fields that tell you who got spawned.
+        private static string ParsePlayer(byte[] b, int off, int len)
         {
             if (len < 12) return null;
-            uint uid = ReadU32(b, off + 4);
-            uint count = len >= 12 ? (uint)ReadU32(b, off + 8) : 0;
-            uint upd = len >= 16 ? (uint)ReadU32(b, off + 12) : 0;
-            ulong data = len >= 24 ? (ulong)BitConverter.ToUInt64(b, off + 16) : 0UL;
-            string tail = "";
-            if (len > 24)
-            {
-                int extra = len - 24;
-                int dumpLen = System.Math.Min(extra, 12);
-                var sb = new StringBuilder();
-                for (int i = 0; i < dumpLen; i++) sb.Append(b[off + 24 + i].ToString("X2"));
-                tail = $" extra[{extra}b]={sb}";
-            }
-            string bitTag = "";
-            if (data != 0)
-            {
-                var bits = new System.Collections.Generic.List<int>();
-                for (int i = 0; i < 64; i++) if ((data & (1UL << i)) != 0) bits.Add(i);
-                bitTag = $" bits={string.Join(",", bits)}";
-            }
-            string fullBody = "";
-            if (data != 0 && len > 0)
-            {
-                // Full body hex dump (useful for capturing a ground-truth
-                // Update(StatusEffects) packet's exact bytes). Only print
-                // when data != 0 to avoid noise on the constant idle
-                // updateType=100 traffic.
-                var sb = new StringBuilder();
-                for (int i = 0; i < len; i++) sb.Append(b[off + i].ToString("X2"));
-                fullBody = $" body={sb}";
-            }
-            return $"{{ uid={uid} count={count} updateType={upd} data=0x{data:X16}{bitTag}{tail}{fullBody} }}";
+            uint uid = ReadU32(b, off);
+            uint mesh = len >= 8 ? (uint)ReadU32(b, off + 4) : 0;
+            return $"{{ uid={uid} mesh={mesh} body={len}b }}";
         }
 
-        // MSG_INTERACT (1022): 28-byte struct. Use the existing InteractPacket
-        // decode path so MagicAttack obfuscation is handled.
+        // MsgUserAttrib (1017 / 10017): patch 5672 layout per the wiki.
+        //   uid:u32 updateCount:u32 statusType:u32 value1:u64 value2:u64 value3:u32
+        // Total body = 32 bytes (matches our wire sz=44 = 4 hdr + 32 body + 8 trailer).
+        // statusType is the StatusEffects enum (bit-shift values; see the
+        // conquer-wiki MsgUserAttrib-Status enum). When value1 has bits set
+        // we annotate with the matching status-effect names.
+        private static string ParseUserAttrib(byte[] b, int off, int len)
+        {
+            if (len < 12) return null;
+            uint uid = ReadU32(b, off);
+            uint count = len >= 8 ? (uint)ReadU32(b, off + 4) : 0;
+            uint status = len >= 12 ? (uint)ReadU32(b, off + 8) : 0;
+            ulong v1 = len >= 20 ? BitConverter.ToUInt64(b, off + 12) : 0UL;
+            ulong v2 = len >= 28 ? BitConverter.ToUInt64(b, off + 20) : 0UL;
+            uint v3 = len >= 32 ? (uint)ReadU32(b, off + 28) : 0;
+
+            // Show v1 as a status-effects bit list only when this is
+            // actually a StatusEffects update (statusType is the wiki's
+            // STATUS enum; the live statuseffect.ini key 23 = CYCLONE is
+            // a *bit position in v1*, not a statusType value).
+            string statusName = StatusEffectName(status);
+            string bitTag = "";
+            if (v1 != 0)
+            {
+                var bits = new System.Collections.Generic.List<string>();
+                for (int i = 0; i < 64; i++)
+                {
+                    if ((v1 & (1UL << i)) == 0) continue;
+                    string nm = StatusEffectBitName(i);
+                    bits.Add(nm != null ? $"{i}({nm})" : i.ToString());
+                }
+                bitTag = $" bits=[{string.Join(",", bits)}]";
+            }
+            string tail = v3 != 0 ? $" v3={v3}" : "";
+            string v2tag = v2 != 0 ? $" v2=0x{v2:X16}" : "";
+            return $"{{ uid={uid} cnt={count} status={statusName}({status}) v1=0x{v1:X16}{bitTag}{v2tag}{tail} }}";
+        }
+
+        // MsgInteract (1022): 28-byte struct (incl. header+trailer math).
+        // Use the existing InteractPacket decode path so the MagicAttack
+        // obfuscation reverse is handled.
         private static string ParseInteract(byte[] chunk, int off, int total)
         {
             if (total < 28) return null;
@@ -199,29 +208,240 @@ namespace ConquerPoc.Packets
             }
         }
 
-        // MSG_SERVER_TIME (1033): year/month/day/hour/min/sec/ms or similar — show first int as a starting clue.
-        private static string ParseServerTime(byte[] b, int off, int len)
+        // MsgWeaponSkill (1025): proficiency/skill exp updates. Wiki layout
+        // varies by patch; the consistent pieces are skill id and experience.
+        private static string ParseWeaponSkill(byte[] b, int off, int len)
         {
-            if (len < 4) return null;
-            uint tick = ReadU32(b, off);
-            return $"{{ tick={tick} bodyLen={len} }}";
+            if (len < 12) return null;
+            uint skillId = ReadU32(b, off);
+            uint level = len >= 8 ? (uint)ReadU32(b, off + 4) : 0;
+            uint exp = len >= 12 ? (uint)ReadU32(b, off + 8) : 0;
+            return $"{{ skill={skillId} lvl={level} exp={exp} }}";
         }
 
-        // MSG_CONNECT (1052): post-auth connect packet (the unencrypted-by-game-key Connect, 36 bytes).
-        // Body layout (5065): some token-ish bytes then "0014 0000" => UID-ish.
+        // MsgData (1033): server time + dataarray scratch packet. Treat as a
+        // tagged 4-int blob.
+        private static string ParseData(byte[] b, int off, int len)
+        {
+            if (len < 4) return null;
+            uint a = ReadU32(b, off);
+            uint c = len >= 8 ? (uint)ReadU32(b, off + 4) : 0;
+            return $"{{ a={a} b={c} body={len}b }}";
+        }
+
+        // MsgConnect (1052): client identity + build version. Patch 5615 layout.
+        //   identity:u32 additionalData:u32 buildVersion:u16 language:char[2]
+        //   macAddress:byte[6] resDatContents:u32
         private static string ParseConnect(byte[] b, int off, int len)
         {
             if (len < 8) return null;
-            // We mostly just want to log that a Connect happened; show hex tail.
-            return $"{{ connect body={len}b }}";
+            uint identity = ReadU32(b, off);
+            uint additional = ReadU32(b, off + 4);
+            ushort buildVersion = len >= 10 ? (ushort)ReadU16(b, off + 8) : (ushort)0;
+            string lang = len >= 12 ? Encoding.ASCII.GetString(b, off + 10, 2) : "";
+            return $"{{ identity={identity} additional={additional} build={buildVersion} lang={lang} }}";
         }
 
-        // MSG_MAP_STATUS (1110): mapId:u32 at offset 4
-        private static string ParseMapStatus(byte[] b, int off, int len)
+        // MsgTick (1012): server-time/sync packet. Mostly an opaque cookie;
+        // surface enough to spot it in the log.
+        private static string ParseTick(byte[] b, int off, int len)
+        {
+            if (len < 4) return null;
+            uint uid = ReadU32(b, off);
+            return $"{{ uid={uid} body={len}b }}";
+        }
+
+        // MsgItemInfo (1008): item descriptor. Wiki shows: uid:u32, itemType:u32,
+        // amount:u16/u32 depending on patch. Surface the id + type at minimum.
+        private static string ParseItemInfo(byte[] b, int off, int len)
+        {
+            if (len < 8) return null;
+            uint itemUid = ReadU32(b, off);
+            uint itemType = ReadU32(b, off + 4);
+            return $"{{ itemUid={itemUid} itemType={itemType} body={len}b }}";
+        }
+
+        // MsgItem (1009): item action request/response. action is the
+        // discriminator. Wire shape: uid:u32 zero:u32 action:u32 timestamp:u32.
+        private static string ParseItem(byte[] b, int off, int len)
+        {
+            if (len < 16) return null;
+            uint uid = ReadU32(b, off);
+            uint action = ReadU32(b, off + 8);
+            uint ts = ReadU32(b, off + 12);
+            return $"{{ uid={uid} action={action} ts={ts} }}";
+        }
+
+        // MsgMapItem (1101): ground item / loot. Wiki: itemUid:u32 lookface:u32
+        // x:u16 y:u16 mode:u16 mask:u16.
+        private static string ParseMapItem(byte[] b, int off, int len)
+        {
+            if (len < 12) return null;
+            uint itemUid = ReadU32(b, off);
+            uint look = ReadU32(b, off + 4);
+            ushort x = (ushort)ReadU16(b, off + 8);
+            ushort y = (ushort)ReadU16(b, off + 10);
+            return $"{{ itemUid={itemUid} look={look} pos=({x},{y}) }}";
+        }
+
+        // MsgMapInfo (1110): mapId:u32 at body offset 4 (after a leading u32).
+        private static string ParseMapInfo(byte[] b, int off, int len)
         {
             if (len < 8) return null;
             uint mapId = ReadU32(b, off + 4);
             return $"{{ mapId={mapId} }}";
+        }
+
+        // MsgNpcInfo (2030): npc spawn. uid:u32 lookface:u16 x:u16 y:u16
+        // type:u16 something:u16 ...
+        private static string ParseNpcInfo(byte[] b, int off, int len)
+        {
+            if (len < 12) return null;
+            uint uid = ReadU32(b, off);
+            ushort x = (ushort)ReadU16(b, off + 8);
+            ushort y = (ushort)ReadU16(b, off + 10);
+            return $"{{ npcUid={uid} pos=({x},{y}) body={len}b }}";
+        }
+
+        // MsgTaskDialog (2032): NPC dialog. action discriminator at offset 8.
+        private static string ParseTaskDialog(byte[] b, int off, int len)
+        {
+            if (len < 12) return null;
+            uint taskId = ReadU32(b, off);
+            uint dialogId = ReadU32(b, off + 4);
+            uint action = ReadU32(b, off + 8);
+            return $"{{ task={taskId} dialog={dialogId} action={action} }}";
+        }
+
+        // MsgPeerage (2064): nobility/rank info. Lead with uid + the action.
+        private static string ParsePeerage(byte[] b, int off, int len)
+        {
+            if (len < 12) return null;
+            uint action = ReadU32(b, off);
+            uint uid = ReadU32(b, off + 4);
+            return $"{{ action={action} uid={uid} body={len}b }}";
+        }
+
+        // MsgUserInfo (1006): character info on login. Patch 5165 layout per
+        // wiki: identity:u32 mesh:u32 hair:u16 silver:u32 cp:u32 exp:u64
+        // [22 bytes pad] strength:u16 agility:u16 vitality:u16 spirit:u16
+        // freeAttr:u16 hp:u16 sp:u16 pk:u16 level:u8 class:u8 [1 pad]
+        // reborn:u8 [1 pad] quizPoints:u32 [12 pad] strListCount:u8 ...
+        private static string ParseUserInfo(byte[] b, int off, int len)
+        {
+            if (len < 90) return null;
+            uint identity = ReadU32(b, off);
+            uint mesh = ReadU32(b, off + 4);
+            uint silver = ReadU32(b, off + 10);
+            uint cp = ReadU32(b, off + 14);
+            byte level = b[off + 62];
+            byte cls = b[off + 63];
+            // String list begins at body offset 83. Read first string = char name.
+            string charName = TryReadFirstNetString(b, off + 83, len - 83);
+            return $"{{ id={identity} name=\"{charName}\" mesh={mesh} silver={silver} cp={cp} lvl={level} class={cls} }}";
+        }
+
+        // ---- enum lookups ----------------------------------------------------
+
+        // StatusEffects bit positions per conquer-wiki/Enums/MsgUserAttrib-Status.
+        // Each entry: the bit-shift count → effect name. Compose with v1 like
+        // (v1 & (1 << N)) != 0.
+        private static readonly Dictionary<int, string> STATUS_EFFECT_BITS = new Dictionary<int, string>
+        {
+            { 0, "BLUE_FLASHING_NAME" }, { 1, "POISONED" }, { 2, "REMOVE_MESH" },
+            { 4, "XP_CIRCLE" }, { 5, "RESTRICT_MOVEMENT" }, { 6, "TEAM_LEADER" },
+            { 7, "STAR_OF_ACCURACY" }, { 8, "SHIELD" }, { 9, "STIGMA" },
+            { 10, "DEAD" }, { 11, "FADE" }, { 14, "RED_NAME" }, { 15, "BLACK_NAME" },
+            { 18, "SUPERMAN" }, { 19, "BODY_SHIELD" }, { 20, "GOD_BELIEVE" },
+            { 22, "TRANSPARENT" }, { 23, "CYCLONE" }, { 27, "FLY" },
+            { 30, "LUCK_DIFFUSE" }, { 31, "LUCK_ABSORB" }, { 32, "CURSED" },
+            { 33, "BLESSED" }, { 34, "TOP_LEADER" }, { 35, "TOP_DEPUTY" },
+            { 36, "TOP_MONTHLY_PK" }, { 37, "TOP_WEEKLY_PK" }, { 38, "TOP_WARRIOR" },
+            { 39, "TOP_TROJAN" }, { 40, "TOP_ARCHER" }, { 41, "TOP_WATER" },
+            { 42, "TOP_FIRE" }, { 43, "TOP_NINJA" }, { 46, "VORTEX" },
+            { 47, "FATAL_STRIKE" }, { 48, "CHAMPION" }, { 50, "MOUNT" },
+            { 51, "TOP_SPOUSE" }, { 52, "ORANGE_SPARKLES" }, { 53, "PURPLE_SPARKLES" },
+            { 54, "DAZED" }, { 55, "RESTORE_AURA" }, { 56, "MOVE_SPEED_RECOVERED" },
+            { 57, "GODLY_SHIELD" }, { 58, "SHOCK_DAZE" }, { 59, "FREEZE" },
+            { 60, "CHAOS_CYCLE" },
+        };
+
+        private static string StatusEffectBitName(int bit)
+        {
+            return STATUS_EFFECT_BITS.TryGetValue(bit, out var n) ? n : null;
+        }
+
+        // MsgUserAttrib `statusType` (the OUTER field, not a bit-shift) tags
+        // what kind of update this is. Common values seen on the wire:
+        //   0=Life 1=MaxLife 2=Mana 3=MaxMana 4=Money 5=Experience 6=Pk
+        //   7=Profession 18=HeavenBlessing 19=DoubleExpTime 23=Reborn
+        //   25=UserStatus 26=StatusEffects 27=Hair 28=Xp 29=LuckyTime
+        //   30=CP 41=EnlightPoints (per 5065 enum; carries forward).
+        private static readonly Dictionary<uint, string> USER_ATTRIB_STATUS = new Dictionary<uint, string>
+        {
+            { 0, "Life" }, { 1, "MaxLife" }, { 2, "Mana" }, { 3, "MaxMana" },
+            { 4, "Money" }, { 5, "Experience" }, { 6, "Pk" }, { 7, "Profession" },
+            { 8, "SizeAdd" }, { 9, "Stamina" }, { 10, "MoneySaved" },
+            { 11, "AdditionalPoint" }, { 12, "Lookface" }, { 13, "Level" },
+            { 14, "Spirit" }, { 15, "Vitality" }, { 16, "Strength" },
+            { 17, "Agility" }, { 18, "HeavenBlessing" }, { 19, "DoubleExpTime" },
+            { 20, "GuildDonation" }, { 21, "CurseTime" }, { 22, "AddTime" },
+            { 23, "Reborn" }, { 25, "UserStatus" }, { 26, "StatusEffects" },
+            { 27, "Hair" }, { 28, "Xp" }, { 29, "LuckyTime" }, { 30, "CP" },
+            { 32, "OnlineTraining" }, { 37, "ExtraBP" }, { 39, "Merchant" },
+            { 40, "Quiz" }, { 41, "EnlightPoints" }, { 44, "BonusBP" },
+            { 45, "BoundCp" }, { 49, "AzureShield" }, { 100, "Heartbeat" },
+        };
+
+        private static string StatusEffectName(uint t)
+        {
+            return USER_ATTRIB_STATUS.TryGetValue(t, out var n) ? n : "type" + t;
+        }
+
+        // MsgAction `Action` discriminator. From Comet 5187 source's
+        // MsgAction.ActionType enum (Comet.Game/Packets/MsgAction.cs).
+        private static readonly Dictionary<ushort, string> ACTION_NAMES = new Dictionary<ushort, string>
+        {
+            { 74, "LoginSpawn" }, { 75, "LoginInventory" },
+            { 76, "LoginRelationships" }, { 77, "LoginProficiencies" },
+            { 78, "LoginSpells" }, { 79, "CharacterDirection" },
+            { 81, "CharacterEmote" }, { 85, "MapPortal" }, { 86, "MapTeleport" },
+            { 92, "CharacterLevelUp" }, { 93, "SpellAbortXp" },
+            { 94, "CharacterRevive" }, { 95, "CharacterDelete" },
+            { 96, "CharacterPkMode" }, { 97, "LoginGuild" }, { 99, "MapMine" },
+            { 101, "MapTeamLeaderStar" }, { 102, "MapQuery" },
+            { 104, "MapSkyColor" }, { 106, "MapTeamMemberStar" },
+            { 108, "MapKickBack" }, { 109, "SpellRemove" },
+            { 110, "ProficiencyRemove" }, { 111, "BoothSpawn" },
+            { 112, "BoothSuspend" }, { 113, "BoothResume" },
+            { 114, "BoothLeave" }, { 116, "ClientCommand" },
+            { 117, "CharacterObservation" }, { 118, "SpellAbortTransform" },
+            { 120, "SpellAbortFlight" }, { 121, "MapGold" },
+            { 123, "RelationshipsEnemy" }, { 126, "ClientDialog" },
+            { 132, "LoginComplete" }, { 133, "MapEffect" },
+            { 134, "LoginOfflineMessages" }, { 135, "MapRemoveSpawn" },
+            { 137, "MapJump" }, { 145, "CharacterDead" },
+            { 146, "MapTeleportEnd" }, { 148, "RelationshipsFriend" },
+            { 151, "CharacterAvatar" }, { 152, "CharacterPartnerInfo" },
+            { 161, "CharacterAway" }, { 162, "MapPathfinding" },
+        };
+
+        private static string ActionName(ushort a)
+        {
+            return ACTION_NAMES.TryGetValue(a, out var n) ? n : "a" + a;
+        }
+
+        // First entry of a NetString list ([count:u8][len:u8][bytes]...).
+        // Used by ParseUserInfo to pull the character name without parsing
+        // the rest of the string list.
+        private static string TryReadFirstNetString(byte[] b, int off, int remaining)
+        {
+            if (remaining < 2 || off + 1 >= b.Length) return "";
+            int count = b[off];
+            if (count == 0) return "";
+            int nameLen = b[off + 1];
+            if (nameLen <= 0 || off + 2 + nameLen > b.Length) return "";
+            return Encoding.UTF8.GetString(b, off + 2, nameLen);
         }
 
         // ---- helpers ---------------------------------------------------------
