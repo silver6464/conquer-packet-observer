@@ -864,38 +864,14 @@ namespace ConquerRevObserver
             }
             if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
             {
-                // c->s requires care because of the DR654→game key handoff:
-                // the first ~167-200 bytes of c->s are encrypted under the
-                // login (DR654) schedule, and the rest under the game key.
-                // We don't yet know where the boundary is in this buffer.
-                // For now, run the bytes through both LOGIN cipher pairs
-                // (since the c2s flow always starts with DR654) and let the
-                // game-key streams continue at IV=0. If the boundary lands
-                // inside the buffer, post-boundary state will be wrong and
-                // we'll see garbage c->s decryption — flag it later if it
-                // happens. Most pre-keyfile c->s is the auth packet anyway.
-                ProxyMain.Log("game", $"active: fast-forwarding c->s LOGIN ciphers by {c2sPend.Length} bytes (may include game-key tail)");
-                // Same reasoning as the s->c block above: feed ciphertext
-                // through DECRYPT mode so the engine's feedback IV evolves
-                // from the wire ciphertext byte (not the freshly-generated
-                // encrypted-of-ciphertext byte).
-                lock (_activeUpstreamLock)
-                {
-                    var scratch = (byte[])c2sPend.Clone();
-                    _upstreamLoginCipher.DecryptC2s(scratch);
-                }
-                lock (_activeDownstreamLock)
-                {
-                    var scratch = (byte[])c2sPend.Clone();
-                    _downstreamLoginCipher.DecryptC2s(scratch);
-                }
-                // For the trailer-scan that ActiveC2sLoginPhase relies on,
-                // produce a "from-IV-0" decryption of the pre-keyfile c->s
-                // bytes using a SEPARATE fresh DR654 cipher (the existing
-                // _downstreamLoginCipher is now N bytes state-advanced). We
-                // reload the schedule from the keyfile to spin up a fresh
-                // instance.
-                _activeC2sRawAccum.Write(c2sPend, 0, c2sPend.Length);
+                // The c->s pre-keyfile buffer almost always straddles the
+                // DR654→game-key boundary: the first ~170 bytes are the
+                // single DR654-encrypted auth packet ending in "TQClient",
+                // everything after is game-key. We must fast-forward the
+                // LOGIN cipher state by exactly the auth bytes and the
+                // GAME cipher state by exactly the post-auth bytes,
+                // otherwise post-keyfile c->s decryption is garbled.
+                int authEnd = -1;
                 try
                 {
                     string keyPath = FindLoadedKeyfilePath();
@@ -904,12 +880,62 @@ namespace ConquerRevObserver
                         var freshKs = GameKeyState.LoadFrom(keyPath);
                         var shadow = (byte[])c2sPend.Clone();
                         freshKs.LoginCrypto.DecryptC2s(shadow);
-                        _activeC2sShadowDecrypted.Write(shadow, 0, shadow.Length);
+                        int trailerIdx = IndexOf(shadow, TQ_CLIENT_TRAILER_ACTIVE);
+                        if (trailerIdx >= 0)
+                        {
+                            authEnd = trailerIdx + TQ_CLIENT_TRAILER_ACTIVE.Length;
+                        }
                     }
                 }
                 catch (Exception e)
                 {
-                    ProxyMain.Log("game", $"active: side-shadow build failed: {e.Message}");
+                    ProxyMain.Log("game", $"active: c->s boundary scan failed: {e.Message}");
+                }
+
+                if (authEnd < 0)
+                {
+                    // Auth packet doesn't end in this buffer — entire buffer
+                    // is DR654. Fast-forward LOGIN ciphers only.
+                    ProxyMain.Log("game", $"active: fast-fwd c->s LOGIN by {c2sPend.Length} bytes (no trailer in buffer)");
+                    lock (_activeUpstreamLock)   { var s = (byte[])c2sPend.Clone(); _upstreamLoginCipher.DecryptC2s(s); }
+                    lock (_activeDownstreamLock) { var s = (byte[])c2sPend.Clone(); _downstreamLoginCipher.DecryptC2s(s); }
+                    _activeC2sRawAccum.Write(c2sPend, 0, c2sPend.Length);
+                    // Build the side-shadow for later trailer scan as before.
+                    try
+                    {
+                        string keyPath = FindLoadedKeyfilePath();
+                        if (keyPath != null)
+                        {
+                            var freshKs = GameKeyState.LoadFrom(keyPath);
+                            var shadow = (byte[])c2sPend.Clone();
+                            freshKs.LoginCrypto.DecryptC2s(shadow);
+                            _activeC2sShadowDecrypted.Write(shadow, 0, shadow.Length);
+                        }
+                    }
+                    catch { }
+                }
+                else
+                {
+                    // Buffer contains the full auth packet plus some post-auth
+                    // bytes. Fast-forward LOGIN by authEnd bytes, GAME by the
+                    // remainder, and mark c->s game-key active.
+                    int postAuth = c2sPend.Length - authEnd;
+                    ProxyMain.Log("game", $"active: c->s auth packet ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME by {postAuth}");
+                    var authPortion = new byte[authEnd];
+                    Buffer.BlockCopy(c2sPend, 0, authPortion, 0, authEnd);
+                    lock (_activeUpstreamLock)   { var s = (byte[])authPortion.Clone(); _upstreamLoginCipher.DecryptC2s(s); }
+                    lock (_activeDownstreamLock) { var s = (byte[])authPortion.Clone(); _downstreamLoginCipher.DecryptC2s(s); }
+                    if (postAuth > 0)
+                    {
+                        var postPortion = new byte[postAuth];
+                        Buffer.BlockCopy(c2sPend, authEnd, postPortion, 0, postAuth);
+                        lock (_activeUpstreamLock)   { var s = (byte[])postPortion.Clone(); _upstreamGameCipher.DecryptC2s(s); }
+                        lock (_activeDownstreamLock) { var s = (byte[])postPortion.Clone(); _downstreamGameCipher.DecryptC2s(s); }
+                    }
+                    // Skip the login-phase state machine entirely — we've
+                    // already crossed the boundary during the fast-forward.
+                    _activeC2sGameKeyActive = true;
+                    ProxyMain.Log("game", "active: c->s game-key mode active (skipped login-phase state machine)");
                 }
             }
         }
