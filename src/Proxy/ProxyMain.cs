@@ -80,7 +80,7 @@ namespace ConquerRevObserver
         /// (chaos_cyc). Try different bits if bit 23 doesn't render the
         /// expected visual.
         /// </summary>
-        public static int InjectEffectBit { get; private set; } = 23;
+        public static int InjectEffectBit { get; private set; } = 24;
 
         // Runtime setter for the in-game `@bit <N>` chat command.
         public static void SetInjectEffectBit(int bit) => InjectEffectBit = bit;

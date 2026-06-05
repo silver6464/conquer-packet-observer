@@ -48,11 +48,17 @@ namespace ConquerPoc
         public static readonly sbyte[] DeltaX = new sbyte[] { 0, -1, -1, -1, 0, 1, 1, 1, 0 };
         public static readonly sbyte[] DeltaY = new sbyte[] { 1, 1, 0, -1, -1, -1, 0, 1, 0 };
 
-        // UpdateType enum values from Redux/Enum/UpdateType.cs
-        public const uint UPDATE_TYPE_STATUS_EFFECTS = 26;
+        // UpdateType enum values from worldconquer (Comet 5180) —
+        // MsgUserAttrib.cs ClientUpdateType enum. Rev 5187 matches this
+        // build (one StatusFlag/Cyclone-fields-shifted patch above 5065).
+        // 5065-era used 26 for StatusEffects + bit 23 for cyclone, but on
+        // 5180 those values shifted: 25 is the status flag, bit 24 is the
+        // cyclone effect. statuseffect.ini on Rev's client confirms 5180+.
+        public const uint UPDATE_TYPE_STATUS_EFFECTS = 25;
 
-        // ClientEffect bitmask values from Redux/Enum/ClientEffect.cs
-        public const ulong CLIENT_EFFECT_CYCLONE = 1UL << 23;
+        // ClientEffect bitmask values from worldconquer States/Status.cs
+        // (StatusSet). Bit 24 = CYCLONE on patch 5180+.
+        public const ulong CLIENT_EFFECT_CYCLONE = 1UL << 24;
     }
 
     /// <summary>
