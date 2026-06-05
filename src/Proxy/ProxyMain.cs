@@ -65,6 +65,12 @@ namespace ConquerRevObserver
         /// </summary>
         public static uint OverridePlayerUid { get; private set; } = 0;
 
+        // Runtime setter so the in-game `@uid <N>` chat command can mutate
+        // this without a proxy restart. Not thread-safe by itself but the
+        // value is read on a single inject path with a stale-but-consistent
+        // read tolerated.
+        public static void SetOverridePlayerUid(uint uid) => OverridePlayerUid = uid;
+
         /// <summary>
         /// Which bit of the StatusEffects bitmask to set in the fake Update
         /// packet. Default = 23 = "Tornado" on the live Rev 5187 client
@@ -75,6 +81,9 @@ namespace ConquerRevObserver
         /// expected visual.
         /// </summary>
         public static int InjectEffectBit { get; private set; } = 23;
+
+        // Runtime setter for the in-game `@bit <N>` chat command.
+        public static void SetInjectEffectBit(int bit) => InjectEffectBit = bit;
 
         public static void Main(string[] args)
         {
@@ -1316,6 +1325,56 @@ namespace ConquerRevObserver
         {
             if (message == null) return;
             string m = message.Trim();
+
+            // NOTE: these chat commands are still forwarded to the server
+            // (the proxy doesn't currently swallow them — that would require
+            // modifying the c->s plaintext buffer before re-encryption,
+            // which is fiddly). The server's chat log WILL show the player
+            // typing `@uid`, `@bit`, `@cyclone`, etc. Use a private channel
+            // or Whisper-to-self if you don't want spectators to see them.
+
+            // @uid <N>  — set the override player UID (live, no restart). Mirrors
+            //             --player-uid. Useful for testing without restarting
+            //             the proxy. Setting 0 reverts to auto-detect.
+            if (m.StartsWith("@uid ", StringComparison.OrdinalIgnoreCase))
+            {
+                string arg = m.Substring(5).Trim();
+                if (uint.TryParse(arg, out var uid))
+                {
+                    ProxyMain.SetOverridePlayerUid(uid);
+                    ProxyMain.Log("cmd", $"@uid: override UID set to {uid}");
+                }
+                else
+                {
+                    ProxyMain.Log("cmd", $"@uid: bad arg '{arg}' (expected uint)");
+                }
+                return;
+            }
+
+            // @bit <N>  — set the StatusEffects bit to flip in the injected
+            //             Update. 0..63. Mirrors --effect-bit.
+            if (m.StartsWith("@bit ", StringComparison.OrdinalIgnoreCase))
+            {
+                string arg = m.Substring(5).Trim();
+                if (int.TryParse(arg, out var bit) && bit >= 0 && bit <= 63)
+                {
+                    ProxyMain.SetInjectEffectBit(bit);
+                    ProxyMain.Log("cmd", $"@bit: effect bit set to {bit} (data = 1 << {bit} = 0x{(1UL << bit):X16})");
+                }
+                else
+                {
+                    ProxyMain.Log("cmd", $"@bit: bad arg '{arg}' (expected 0..63)");
+                }
+                return;
+            }
+
+            // @status — print current override values without firing anything.
+            if (m.Equals("@status", StringComparison.OrdinalIgnoreCase))
+            {
+                ProxyMain.Log("cmd", $"@status: override UID={ProxyMain.OverridePlayerUid}, auto UID={_activePlayerUid}, effect bit={ProxyMain.InjectEffectBit}");
+                return;
+            }
+
             if (m.Equals("@cyclone", StringComparison.OrdinalIgnoreCase))
             {
                 // Either auto-detected UID OR the --player-uid override is
@@ -1323,7 +1382,7 @@ namespace ConquerRevObserver
                 // do its own no-uid check if both are zero.
                 if (_activePlayerUid == 0 && ProxyMain.OverridePlayerUid == 0)
                 {
-                    ProxyMain.Log("inject", "@cyclone: no player UID known (auto-detect missed, no --player-uid override); skipping");
+                    ProxyMain.Log("inject", "@cyclone: no player UID known (auto-detect missed, no --player-uid override or @uid); skipping");
                     return;
                 }
                 if (_activeCycloneActive)
