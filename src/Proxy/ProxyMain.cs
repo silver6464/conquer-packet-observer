@@ -827,20 +827,75 @@ namespace ConquerRevObserver
                 }
             }
 
-            // Both directions: replay the stalled bytes through the freshly-
-            // initialized cipher pairs (started at IV=0 in both pairs). The
-            // client and server haven't been able to send any 5817 bytes
-            // past us during the stall, so their CFB states are also still
-            // at IV=0. Replaying from byte 0 keeps everyone in lockstep.
+            // Fast-forward the cipher pairs by running the accumulated
+            // pre-keyfile ciphertext through each of the four CFB streams.
+            // We discard the output and care only about the resulting IV
+            // state. After this, all four of our streams' IVs match the
+            // corresponding real party's IV at the same byte position,
+            // and we can re-encrypt cleanly from here on.
             if (s2cPend != null && s2cPend.Length > 0 && _activeKeyState != null)
             {
-                ProxyMain.Log("game", $"active: replaying {s2cPend.Length} stalled s->c bytes from IV=0");
-                ActiveProcessS2c(s2cPend);
+                ProxyMain.Log("game", $"active: fast-forwarding s->c ciphers by {s2cPend.Length} bytes");
+                // Server's s->c encrypt state → our upstream s2c-decrypt
+                // (both end up with the same IV after processing the same ciphertext).
+                lock (_activeUpstreamLock)
+                {
+                    var scratch = (byte[])s2cPend.Clone();
+                    _upstreamGameCipher.DecryptS2c(scratch);
+                }
+                // Client's s->c decrypt state → our downstream s2c-encrypt
+                // (same logic: same ciphertext bytes evolve IV identically).
+                lock (_activeDownstreamLock)
+                {
+                    var scratch = (byte[])s2cPend.Clone();
+                    _downstreamGameCipher.EncryptS2c(scratch);
+                }
             }
             if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
             {
-                ProxyMain.Log("game", $"active: replaying {c2sPend.Length} stalled c->s bytes from IV=0");
-                ActiveProcessC2s(c2sPend);
+                // c->s requires care because of the DR654→game key handoff:
+                // the first ~167-200 bytes of c->s are encrypted under the
+                // login (DR654) schedule, and the rest under the game key.
+                // We don't yet know where the boundary is in this buffer.
+                // For now, run the bytes through both LOGIN cipher pairs
+                // (since the c2s flow always starts with DR654) and let the
+                // game-key streams continue at IV=0. If the boundary lands
+                // inside the buffer, post-boundary state will be wrong and
+                // we'll see garbage c->s decryption — flag it later if it
+                // happens. Most pre-keyfile c->s is the auth packet anyway.
+                ProxyMain.Log("game", $"active: fast-forwarding c->s LOGIN ciphers by {c2sPend.Length} bytes (may include game-key tail)");
+                lock (_activeUpstreamLock)
+                {
+                    var scratch = (byte[])c2sPend.Clone();
+                    _upstreamLoginCipher.EncryptC2s(scratch);
+                }
+                lock (_activeDownstreamLock)
+                {
+                    var scratch = (byte[])c2sPend.Clone();
+                    _downstreamLoginCipher.DecryptC2s(scratch);
+                }
+                // For the trailer-scan that ActiveC2sLoginPhase relies on,
+                // produce a "from-IV-0" decryption of the pre-keyfile c->s
+                // bytes using a SEPARATE fresh DR654 cipher (the existing
+                // _downstreamLoginCipher is now N bytes state-advanced). We
+                // reload the schedule from the keyfile to spin up a fresh
+                // instance.
+                _activeC2sRawAccum.Write(c2sPend, 0, c2sPend.Length);
+                try
+                {
+                    string keyPath = FindLoadedKeyfilePath();
+                    if (keyPath != null)
+                    {
+                        var freshKs = GameKeyState.LoadFrom(keyPath);
+                        var shadow = (byte[])c2sPend.Clone();
+                        freshKs.LoginCrypto.DecryptC2s(shadow);
+                        _activeC2sShadowDecrypted.Write(shadow, 0, shadow.Length);
+                    }
+                }
+                catch (Exception e)
+                {
+                    ProxyMain.Log("game", $"active: side-shadow build failed: {e.Message}");
+                }
             }
         }
 
@@ -861,24 +916,30 @@ namespace ConquerRevObserver
 
                 if (_activeKeyState == null)
                 {
-                    // Key not ready yet. Active MitM needs to be in the
-                    // cipher loop from byte 0 of the 5817 stream (since both
-                    // the client's and the server's CFB-64 states start at
-                    // IV=0 and evolve byte-by-byte). If we forward bytes
-                    // through here pre-keyfile, the proxy's own cipher
-                    // initialized later at IV=0 won't match the client's
-                    // already-evolved state.
+                    // Key not ready yet. Two simultaneous requirements:
+                    //   1) The client and server are talking and we can't
+                    //      stall the connection or the client times out.
+                    //   2) We need our four CFB streams to eventually
+                    //      align with the real client+server states.
                     //
-                    // Solution: stall both directions until the keyfile
-                    // lands. Buffer the bytes; the flush task replays them
-                    // through the freshly-initialized ciphers (from IV=0)
-                    // and forwards the re-encrypted output. Risk: client
-                    // may time out during the stall (typically 3-4s).
+                    // Solution: forward the bytes unmodified (clients and
+                    // servers continue to communicate), AND accumulate the
+                    // ciphertext bytes per direction. When the keyfile
+                    // arrives, we'll fast-forward each cipher state by
+                    // running the accumulated bytes through it. CFB-64's
+                    // IV state after N bytes is a function of just the
+                    // ciphertext that flowed; same ciphertext goes into
+                    // the feedback IV in both encrypt and decrypt modes
+                    // (see BlowfishCfb64.ProcessBytes), so once we replay
+                    // the buffered bytes through each of our four streams,
+                    // every stream's IV matches the corresponding real
+                    // party's IV. Re-encryption from that point is clean.
                     lock (_activePendingLock)
                     {
                         var pending = isServerToClient ? _activeS2cPending : _activeC2sPending;
                         pending.Write(chunk, 0, n);
                     }
+                    try { to.Write(chunk, 0, n); } catch { return; }
                     continue;
                 }
 
