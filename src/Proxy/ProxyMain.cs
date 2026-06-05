@@ -827,22 +827,20 @@ namespace ConquerRevObserver
                 }
             }
 
-            // c->s: must replay through the cipher AND forward re-encrypted bytes
-            // to the server, otherwise the server's c->s cipher state desyncs.
+            // Both directions: replay the stalled bytes through the freshly-
+            // initialized cipher pairs (started at IV=0 in both pairs). The
+            // client and server haven't been able to send any 5817 bytes
+            // past us during the stall, so their CFB states are also still
+            // at IV=0. Replaying from byte 0 keeps everyone in lockstep.
+            if (s2cPend != null && s2cPend.Length > 0 && _activeKeyState != null)
+            {
+                ProxyMain.Log("game", $"active: replaying {s2cPend.Length} stalled s->c bytes from IV=0");
+                ActiveProcessS2c(s2cPend);
+            }
             if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
             {
-                ProxyMain.Log("game", $"active: flushing {c2sPend.Length} stashed c->s bytes (re-encrypt + forward)");
+                ProxyMain.Log("game", $"active: replaying {c2sPend.Length} stalled c->s bytes from IV=0");
                 ActiveProcessC2s(c2sPend);
-            }
-
-            // s->c: discard pre-keyfile bytes (same reasoning as observe-only).
-            // We forwarded them to the client already (as ciphertext from the
-            // server) so the client's s->c cipher is N bytes ahead of where
-            // the proxy is starting from. Aligning is impossible without
-            // re-doing the handshake; accept losing the first ~10 packets.
-            if (s2cPend != null && s2cPend.Length > 0)
-            {
-                ProxyMain.Log("game", $"active: discarding {s2cPend.Length} pre-keyfile s->c bytes (session start lost)");
             }
         }
 
@@ -863,22 +861,24 @@ namespace ConquerRevObserver
 
                 if (_activeKeyState == null)
                 {
-                    // Key not ready yet. Buffer for replay; do NOT forward —
-                    // unlike observe-only mode, active mitm cannot let bytes
-                    // through that we'd be unable to re-encrypt later. The
-                    // client will retry. (This may stall the handshake a few
-                    // seconds longer than observe-only does.)
+                    // Key not ready yet. Active MitM needs to be in the
+                    // cipher loop from byte 0 of the 5817 stream (since both
+                    // the client's and the server's CFB-64 states start at
+                    // IV=0 and evolve byte-by-byte). If we forward bytes
+                    // through here pre-keyfile, the proxy's own cipher
+                    // initialized later at IV=0 won't match the client's
+                    // already-evolved state.
+                    //
+                    // Solution: stall both directions until the keyfile
+                    // lands. Buffer the bytes; the flush task replays them
+                    // through the freshly-initialized ciphers (from IV=0)
+                    // and forwards the re-encrypted output. Risk: client
+                    // may time out during the stall (typically 3-4s).
                     lock (_activePendingLock)
                     {
                         var pending = isServerToClient ? _activeS2cPending : _activeC2sPending;
                         pending.Write(chunk, 0, n);
                     }
-                    // We still have to forward the bytes onward, otherwise
-                    // the connection stalls. In active mitm we forward
-                    // ciphertext unmodified pre-keyfile (which is fine — the
-                    // server and client are already speaking the same
-                    // cipher, the proxy just hasn't joined yet).
-                    try { to.Write(chunk, 0, n); } catch { return; }
                     continue;
                 }
 
