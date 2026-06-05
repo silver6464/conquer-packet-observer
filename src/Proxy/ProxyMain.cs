@@ -928,22 +928,30 @@ namespace ConquerRevObserver
             // state. After this, all four of our streams' IVs match the
             // corresponding real party's IV at the same byte position,
             // and we can re-encrypt cleanly from here on.
-            // s->c handling: do NOT fast-forward the cipher state. Empirical
-            // evidence (observe-only mode decrypts post-keyfile s->c cleanly
-            // starting from IV=0) shows that the server's s->c BF_cfb64
-            // game-key cipher is at IV=0 right when the keyfile lands.
-            // Whatever pre-keyfile s->c bytes the proxy forwarded to the
-            // client weren't part of that cipher stream (probably a separate
-            // handshake/greeting channel). If we fast-forward our cipher by
-            // those non-cipher bytes, our IV diverges from the server's.
+            // s->c handling: the cipher pair was already seeded with the
+            // client's actual (IV, num) snapshot by GameKeyState.LoadFrom
+            // (keyfile v4 cfb.s2c block). The pre-keyfile bytes the proxy
+            // forwarded were already consumed by the client's BF_cfb64 at
+            // capture time, and the snapshot captures the state AFTER that
+            // consumption. So we must NOT re-process those bytes through
+            // our mirror — that would double-advance the IV.
             //
-            // So we leave the s->c game cipher pair at IV=0 and rely on the
-            // assumption that the client's s->c-decrypt is also at IV=0
-            // (consistent with observe-only's success). The pre-keyfile s->c
-            // bytes already reached the client unmodified.
+            // For v3 keyfiles (no cfb block) the ciphers start at IV=0/num=0
+            // and we rely on the previous empirical assumption ("usually
+            // works"). Upgrade frida_key_capture.py to emit v4 for reliable
+            // injects.
             if (s2cPend != null && s2cPend.Length > 0)
             {
-                ProxyMain.Log("game", $"active: NOT fast-forwarding s->c ({s2cPend.Length} pre-key bytes treated as out-of-cipher-stream)");
+                bool haveSnapshot = _activeKeyState != null
+                    && _activeKeyState.IvS2c != null;
+                if (haveSnapshot)
+                {
+                    ProxyMain.Log("game", $"active: s->c cipher pre-seeded from cfb snapshot (client processed {_activeKeyState.BytesS2c}b, num={_activeKeyState.NumS2c}); {s2cPend.Length} pre-key bytes intentionally NOT replayed");
+                }
+                else
+                {
+                    ProxyMain.Log("game", $"active: NOT fast-forwarding s->c ({s2cPend.Length} pre-key bytes, no cfb snapshot in keyfile — alignment may be intermittent)");
+                }
             }
             if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
             {
@@ -1000,15 +1008,26 @@ namespace ConquerRevObserver
                 else
                 {
                     // Buffer contains the full auth packet plus some post-auth
-                    // bytes. Fast-forward LOGIN by authEnd bytes, GAME by the
-                    // remainder, and mark c->s game-key active.
+                    // bytes. Fast-forward LOGIN by authEnd bytes; for GAME,
+                    // skip the fast-forward when we have a cfb snapshot in
+                    // the keyfile (the snapshot already encodes the client's
+                    // post-snapshot IV/num — re-running these bytes would
+                    // double-advance the IV).
                     int postAuth = c2sPend.Length - authEnd;
-                    ProxyMain.Log("game", $"active: c->s auth packet ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME by {postAuth}");
+                    bool haveC2sSnapshot = _activeKeyState != null && _activeKeyState.IvC2s != null;
+                    if (haveC2sSnapshot)
+                    {
+                        ProxyMain.Log("game", $"active: c->s auth ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME pre-seeded from cfb snapshot (client processed {_activeKeyState.BytesC2s}b, num={_activeKeyState.NumC2s}); skip GAME replay of {postAuth}b");
+                    }
+                    else
+                    {
+                        ProxyMain.Log("game", $"active: c->s auth packet ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME by {postAuth}");
+                    }
                     var authPortion = new byte[authEnd];
                     Buffer.BlockCopy(c2sPend, 0, authPortion, 0, authEnd);
                     lock (_activeUpstreamLock)   { var s = (byte[])authPortion.Clone(); _upstreamLoginCipher.DecryptC2s(s); }
                     lock (_activeDownstreamLock) { var s = (byte[])authPortion.Clone(); _downstreamLoginCipher.DecryptC2s(s); }
-                    if (postAuth > 0)
+                    if (postAuth > 0 && !haveC2sSnapshot)
                     {
                         var postPortion = new byte[postAuth];
                         Buffer.BlockCopy(c2sPend, authEnd, postPortion, 0, postAuth);
@@ -2038,19 +2057,33 @@ namespace ConquerRevObserver
         public GameCryptography Crypto;       // game schedule (both dirs)
         public GameCryptography LoginCrypto;  // DR654 schedule (c->s auth only)
 
+        // CFB snapshot captured by Frida at keyfile-write time. Null when
+        // the keyfile is a v3 file with no snapshot.
+        public byte[] IvC2s;
+        public int    NumC2s;
+        public long   BytesC2s;
+        public byte[] IvS2c;
+        public int    NumS2c;
+        public long   BytesS2c;
+
         public static GameKeyState LoadFrom(string path)
         {
-            // session.json v3:
+            // session.json v4:
             // {
-            //   "version": 3,
+            //   "version": 4,
             //   "login": { "p": [...], "s": [...] },
             //   "game":  { "p": [...], "s": [...] },
+            //   "cfb": {
+            //     "s2c": { "iv": [...8 bytes...], "num": N, "bytes_processed": M },
+            //     "c2s": { "iv": [...8 bytes...], "num": N, "bytes_processed": M }
+            //   },
             //   "p": [...], "s": [...]   // back-compat alias for game
             // }
             string text = File.ReadAllText(path);
 
             string gameSection = ExtractObject(text, "game");
             string loginSection = ExtractObject(text, "login");
+            string cfbSection = ExtractObject(text, "cfb");
 
             uint[] gameP, gameS;
             if (gameSection != null)
@@ -2069,7 +2102,33 @@ namespace ConquerRevObserver
             {
                 Crypto = new GameCryptography(new byte[] { 0 }),
             };
-            state.Crypto.LoadSchedules(gameP, gameS);
+
+            if (cfbSection != null)
+            {
+                string s2c = ExtractObject(cfbSection, "s2c");
+                string c2s = ExtractObject(cfbSection, "c2s");
+                if (s2c != null && c2s != null)
+                {
+                    state.IvS2c = ParseByteArray(s2c, "iv", 8);
+                    state.NumS2c = ParseInt(s2c, "num");
+                    state.BytesS2c = ParseLong(s2c, "bytes_processed");
+                    state.IvC2s = ParseByteArray(c2s, "iv", 8);
+                    state.NumC2s = ParseInt(c2s, "num");
+                    state.BytesC2s = ParseLong(c2s, "bytes_processed");
+                    state.Crypto.LoadSchedulesWithState(
+                        gameP, gameS,
+                        state.IvC2s, state.NumC2s,
+                        state.IvS2c, state.NumS2c);
+                }
+                else
+                {
+                    state.Crypto.LoadSchedules(gameP, gameS);
+                }
+            }
+            else
+            {
+                state.Crypto.LoadSchedules(gameP, gameS);
+            }
 
             if (loginSection != null)
             {
@@ -2121,6 +2180,52 @@ namespace ConquerRevObserver
                 arr[i] = Convert.ToUInt32(raw, 16);
             }
             return arr;
+        }
+
+        private static byte[] ParseByteArray(string body, string key, int expectedLen)
+        {
+            int k = body.IndexOf("\"" + key + "\"");
+            if (k < 0) throw new FormatException("missing " + key);
+            int br = body.IndexOf('[', k);
+            int en = body.IndexOf(']', br);
+            string inner = body.Substring(br + 1, en - br - 1);
+            var parts = inner.Split(',');
+            if (parts.Length != expectedLen)
+                throw new FormatException($"{key}: expected {expectedLen} bytes, got {parts.Length}");
+            var arr = new byte[expectedLen];
+            for (int i = 0; i < expectedLen; i++)
+            {
+                string raw = parts[i].Trim().Trim('"');
+                if (raw.StartsWith("0x") || raw.StartsWith("0X")) raw = raw.Substring(2);
+                arr[i] = Convert.ToByte(raw, 16);
+            }
+            return arr;
+        }
+
+        private static int ParseInt(string body, string key)
+        {
+            int k = body.IndexOf("\"" + key + "\"");
+            if (k < 0) throw new FormatException("missing " + key);
+            int colon = body.IndexOf(':', k);
+            int comma = body.IndexOf(',', colon);
+            int brace = body.IndexOf('}', colon);
+            int end = (comma >= 0 && (brace < 0 || comma < brace)) ? comma : brace;
+            if (end < 0) end = body.Length;
+            string raw = body.Substring(colon + 1, end - colon - 1).Trim().Trim('"');
+            return int.Parse(raw);
+        }
+
+        private static long ParseLong(string body, string key)
+        {
+            int k = body.IndexOf("\"" + key + "\"");
+            if (k < 0) throw new FormatException("missing " + key);
+            int colon = body.IndexOf(':', k);
+            int comma = body.IndexOf(',', colon);
+            int brace = body.IndexOf('}', colon);
+            int end = (comma >= 0 && (brace < 0 || comma < brace)) ? comma : brace;
+            if (end < 0) end = body.Length;
+            string raw = body.Substring(colon + 1, end - colon - 1).Trim().Trim('"');
+            return long.Parse(raw);
         }
     }
 }

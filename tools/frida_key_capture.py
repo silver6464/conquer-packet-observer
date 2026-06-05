@@ -45,7 +45,8 @@ JS = r"""
 'use strict';
 (function () {
 
-const BF_SET_KEY_RVA = ptr(""" + hex(BF_SET_KEY_RVA) + r""");
+const BF_SET_KEY_RVA       = ptr(""" + hex(BF_SET_KEY_RVA) + r""");
+const BF_CFB64_ENCRYPT_RVA = ptr(""" + hex(BF_CFB64_ENCRYPT_RVA) + r""");
 
 let conquer = null;
 const tryHook = function () {
@@ -58,11 +59,24 @@ const tryHook = function () {
 // Capture two schedules:
 //   - login (16-byte DR654) for the c->s auth packet phase
 //   - game  (64-byte DH-derived) for the post-auth game-key phase
-// We need BOTH because Rev's BF_set_key may produce a non-OpenSSL schedule;
-// computing DR654's schedule ourselves can be wrong. Capturing the actual
-// schedule the client uses sidesteps that whole question.
+// AND the game cipher's per-direction CFB IV/num state at the moment we
+// snapshot. The schedule alone is not enough: BF_cfb64_encrypt is stateful
+// (the IV evolves byte-by-byte, num is the 0..7 keystream index), and
+// proxy-side decrypts only align if we start from the SAME (IV, num) the
+// client is at when the keyfile lands.
 const haveCaptured = { login: false, game: false };
 const captured = { login: null, game: null };
+// gameBfkeyPtr = address of the BF_KEY whose set_key call had keylen != 16.
+// We use it to distinguish game-cipher BF_cfb64 calls from login-cipher
+// ones (same schedule pointer means same cipher).
+let gameBfkeyPtr = null;
+// State per direction. dir 's2c' = BF_cfb64 called with enc=0 (decrypt
+// incoming); dir 'c2s' = enc=1 (encrypt outgoing). We snapshot iv[8] and
+// *num after each call.
+const cfbState = {
+    s2c: { iv: null, num: 0, bytes: 0 },
+    c2s: { iv: null, num: 0, bytes: 0 },
+};
 let doneSent = false;
 
 const readSchedule = function (bfkey_ptr) {
@@ -77,9 +91,43 @@ const readSchedule = function (bfkey_ptr) {
     return { P: P, S: S };
 };
 
+const readBytes = function (ptr_, n) {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(ptr_.add(i).readU8());
+    return out;
+};
+
+const trySendDone = function () {
+    if (doneSent) return;
+    if (!haveCaptured.login || !haveCaptured.game) return;
+    // Always send: if cfbState.s2c.iv is still null, the client hasn't
+    // processed any s->c game-cipher bytes yet, so IV=0/num=0 is correct.
+    const ivZero = [0,0,0,0,0,0,0,0];
+    doneSent = true;
+    send({
+        kind: 'done',
+        login: { p: captured.login.P, s: captured.login.S },
+        game:  { p: captured.game.P,  s: captured.game.S  },
+        cfb: {
+            s2c: {
+                iv:  cfbState.s2c.iv  || ivZero,
+                num: cfbState.s2c.num,
+                bytes_processed: cfbState.s2c.bytes,
+            },
+            c2s: {
+                iv:  cfbState.c2s.iv  || ivZero,
+                num: cfbState.c2s.num,
+                bytes_processed: cfbState.c2s.bytes,
+            },
+        },
+    });
+};
+
 const installHooks = function () {
     const setKey = conquer.base.add(BF_SET_KEY_RVA);
-    console.log('[+] hooking BF_set_key at ' + setKey);
+    const cfb    = conquer.base.add(BF_CFB64_ENCRYPT_RVA);
+    console.log('[+] hooking BF_set_key       at ' + setKey);
+    console.log('[+] hooking BF_cfb64_encrypt at ' + cfb);
 
     Interceptor.attach(setKey, {
         onEnter: function (args) {
@@ -87,7 +135,6 @@ const installHooks = function () {
             this.keylen   = args[1].toInt32();
         },
         onLeave: function (_retval) {
-            if (doneSent) return;
             if (!this.bfkey_ptr || this.bfkey_ptr.isNull()) return;
 
             // Multiple BF_set_key calls per session — some are login key
@@ -95,27 +142,84 @@ const installHooks = function () {
             // (64-byte). Capture each kind once.
             const which = (this.keylen === 16) ? 'login' : (this.keylen > 16 ? 'game' : null);
             if (which === null) return;
-            if (haveCaptured[which]) return;
+
+            // We allow re-capture of game key in case the client renegotiates
+            // a new DH key mid-session. But once we've sent the keyfile we
+            // don't re-emit (the proxy will pick up a new keyfile if one
+            // appears, but for now one-shot capture is the simpler path).
+            if (haveCaptured[which] && which === 'login') return;
 
             try {
                 const sched = readSchedule(this.bfkey_ptr);
                 captured[which] = sched;
                 haveCaptured[which] = true;
+                if (which === 'game') {
+                    gameBfkeyPtr = this.bfkey_ptr;
+                    // A new game key invalidates prior CFB state.
+                    cfbState.s2c = { iv: null, num: 0, bytes: 0 };
+                    cfbState.c2s = { iv: null, num: 0, bytes: 0 };
+                }
                 console.log('[+] captured ' + which + ' BF_KEY  ptr=' + this.bfkey_ptr +
                             '  keylen=' + this.keylen);
-                if (haveCaptured.login && haveCaptured.game && !doneSent) {
-                    doneSent = true;
-                    send({
-                        kind: 'done',
-                        login: { p: captured.login.P, s: captured.login.S },
-                        game:  { p: captured.game.P,  s: captured.game.S  },
-                    });
+                // Hold off on sending the keyfile for game-key captures —
+                // wait until we've observed at least one BF_cfb64 call in
+                // each direction so we know the client's actual IV/num
+                // state. If no BF_cfb64 calls happen for a while, sendNow()
+                // below (via a fallback timer) ships IV=0/num=0.
+                if (which === 'login' && haveCaptured.game && haveCaptured.login) {
+                    trySendDone();
                 }
             } catch (e) {
                 console.error('  capture error: ' + e);
             }
         }
     });
+
+    // Hook BF_cfb64_encrypt to snapshot per-direction CFB state. The OpenSSL
+    // signature is:
+    //   void BF_cfb64_encrypt(in, out, length, schedule, ivec, num, enc)
+    //   args: [0]=in [1]=out [2]=length [3]=schedule [4]=ivec [5]=num [6]=enc
+    // After the call, ivec[0..7] has been updated and *num is the byte index
+    // within the current 8-byte keystream block (0..7).
+    Interceptor.attach(cfb, {
+        onEnter: function (args) {
+            this.schedule = args[3];
+            this.ivec     = args[4];
+            this.numPtr   = args[5];
+            this.enc      = args[6].toInt32();
+            this.length   = args[2].toInt32();
+            this.isGame   = (gameBfkeyPtr !== null && this.schedule.equals(gameBfkeyPtr));
+            if (this.length <= 0 || this.length > 65536) this.skip = true;
+        },
+        onLeave: function (_retval) {
+            if (this.skip) return;
+            if (!this.isGame) return;
+            try {
+                const dir = (this.enc === 0) ? 's2c' : 'c2s';
+                cfbState[dir].iv    = readBytes(this.ivec, 8);
+                cfbState[dir].num   = this.numPtr.readU32() & 0xFF;
+                cfbState[dir].bytes += this.length;
+                // Try to send: if both directions have at least one call and
+                // both schedules are captured, ship the keyfile.
+                if (haveCaptured.login && haveCaptured.game &&
+                    cfbState.s2c.iv !== null && cfbState.c2s.iv !== null) {
+                    trySendDone();
+                }
+            } catch (e) {
+                console.error('  cfb snapshot error: ' + e);
+            }
+        }
+    });
+
+    // Safety net: if neither direction emits a BF_cfb64 call within 2s of
+    // capturing the game key, ship IV=0/num=0 anyway (matches the old
+    // behavior). This keeps the proxy unblocked when the client is idle.
+    setTimeout(function () {
+        if (haveCaptured.login && haveCaptured.game && !doneSent) {
+            console.log('[!] no BF_cfb64 calls observed within 2s of game key — shipping IV=0');
+            trySendDone();
+        }
+    }, 2000);
 
     console.log('[+] installed. Trigger a login.');
 };
@@ -141,11 +245,20 @@ def write_keyfile(payload, outdir):
     ts = time.strftime("%Y%m%d_%H%M%S")
     tmp = os.path.join(outdir, f"session_{ts}.json.tmp")
     final = os.path.join(outdir, f"session_{ts}.json")
-    # Schema (v3): both DR654 login schedule and DH-derived game schedule.
-    # Backwards-compatible top-level p/s = game schedule for older proxy
-    # builds that expect a single schedule.
+    # Schema (v4): adds "cfb" with per-direction (iv, num, bytes_processed)
+    # snapshots from the client's actual BF_cfb64_encrypt calls at the
+    # moment the game key was active. Proxy seeds its mirror ciphers with
+    # this so the s->c stream stays aligned with the client regardless of
+    # how many pre-keyfile bytes flowed.
+    # Schema (v3, still emitted as fallback): both DR654 login schedule
+    # and DH-derived game schedule. Top-level p/s = game schedule alias
+    # for older proxy builds.
+    cfb = payload.get("cfb") or {
+        "s2c": {"iv": [0]*8, "num": 0, "bytes_processed": 0},
+        "c2s": {"iv": [0]*8, "num": 0, "bytes_processed": 0},
+    }
     doc = {
-        "version": 3,
+        "version": 4,
         "login": {
             "p": to_hex_array(payload["login"]["p"]),
             "s": to_hex_array(payload["login"]["s"]),
@@ -154,6 +267,18 @@ def write_keyfile(payload, outdir):
             "p": to_hex_array(payload["game"]["p"]),
             "s": to_hex_array(payload["game"]["s"]),
         },
+        "cfb": {
+            "s2c": {
+                "iv":  [f"0x{b & 0xFF:02X}" for b in cfb["s2c"]["iv"]],
+                "num": cfb["s2c"]["num"],
+                "bytes_processed": cfb["s2c"]["bytes_processed"],
+            },
+            "c2s": {
+                "iv":  [f"0x{b & 0xFF:02X}" for b in cfb["c2s"]["iv"]],
+                "num": cfb["c2s"]["num"],
+                "bytes_processed": cfb["c2s"]["bytes_processed"],
+            },
+        },
         "p": to_hex_array(payload["game"]["p"]),
         "s": to_hex_array(payload["game"]["s"]),
     }
@@ -161,6 +286,10 @@ def write_keyfile(payload, outdir):
         json.dump(doc, f, indent=2)
     os.replace(tmp, final)
     print(f"[+] wrote keyfile: {final}")
+    s2c_b = cfb["s2c"]["bytes_processed"]
+    c2s_b = cfb["c2s"]["bytes_processed"]
+    print(f"    cfb: s2c bytes={s2c_b} num={cfb['s2c']['num']}, "
+          f"c2s bytes={c2s_b} num={cfb['c2s']['num']}")
 
 
 def main():

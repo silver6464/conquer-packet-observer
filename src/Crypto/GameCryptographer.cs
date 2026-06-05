@@ -47,6 +47,18 @@ namespace ConquerPoc.Cryptography
             _decrypt.LoadSchedule(p, s, zeroIv);
         }
 
+        // Resume both CFB streams from a snapshot of the client's state.
+        // _encrypt is the c2s engine (BF_cfb64 enc=1), _decrypt is the s2c
+        // engine (BF_cfb64 enc=0).
+        public void LoadSchedulesWithState(
+            uint[] p, uint[] s,
+            byte[] ivC2s, int numC2s,
+            byte[] ivS2c, int numS2c)
+        {
+            _encrypt.LoadScheduleAndState(p, s, ivC2s, numC2s);
+            _decrypt.LoadScheduleAndState(p, s, ivS2c, numS2c);
+        }
+
         // Observer-mode decrypters. CFB-64 decrypt and encrypt feed the IV differently
         // (encrypt feeds output byte, decrypt feeds input byte), so we MUST use
         // ProcessBytes(_, encrypting:false) on both.
@@ -138,6 +150,48 @@ namespace ConquerPoc.Cryptography
             _engine.LoadSchedule(p, s);
             System.Array.Copy(iv, _feedback, 8);
             _idx = 0;
+        }
+
+        // CFB-resume variant: load schedule + seed IV + seed num (the byte
+        // index 0..7 within the current keystream block). Used when the
+        // Frida hook snapshots the client's BF_cfb64 state mid-stream — we
+        // must match exactly, not start fresh at IV=0/num=0.
+        //
+        // Special handling for num != 0: OpenSSL's BF_cfb64 stores the
+        // *evolving* IV in ivec (i.e. ivec[0..num-1] is already used keystream,
+        // ivec[num..7] is fresh). To pre-fill _keystream, we need to encrypt
+        // the keystream block once. The way the loop in ProcessBytes works,
+        // when _idx == 0 it calls _engine.EncryptBlock(_feedback) into
+        // _keystream. We mirror that here so _idx > 0 starts at the right
+        // position in the same keystream block.
+        public void LoadScheduleAndState(uint[] p, uint[] s, byte[] iv, int num)
+        {
+            _engine.LoadSchedule(p, s);
+            System.Array.Copy(iv, _feedback, 8);
+            _idx = num & 7;
+            if (_idx != 0)
+            {
+                // Reconstruct the keystream the client is part-way through.
+                // OpenSSL stores the post-encrypt block back into ivec, then
+                // when it XORs each byte it overwrites ivec[num] with either
+                // input (decrypt) or output (encrypt). So at snapshot time,
+                // ivec[num..7] is the unused tail of the encrypted block,
+                // and ivec[0..num-1] is the feedback for the next block.
+                //
+                // Our ProcessBytes computes a fresh keystream when _idx==0
+                // by encrypting _feedback. If we set _idx=num, we need
+                // _keystream to be the SAME block that the client currently
+                // has half-consumed. The simplest reconstruction is: copy
+                // ivec into _keystream (its tail bytes are the unused
+                // keystream), and accept that _feedback already holds the
+                // full evolving IV for the *next* block.
+                //
+                // This is only exactly right when num != 0 and the client
+                // captured ivec from inside an OpenSSL BF_cfb64 call —
+                // which matches our Frida snapshot point. If num==0 the
+                // standard LoadSchedule path is fine.
+                System.Array.Copy(iv, _keystream, 8);
+            }
         }
 
         // Copy the current CFB state (IV and byte index within the keystream
