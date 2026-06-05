@@ -928,22 +928,28 @@ namespace ConquerRevObserver
             // state. After this, all four of our streams' IVs match the
             // corresponding real party's IV at the same byte position,
             // and we can re-encrypt cleanly from here on.
-            // s->c handling: do NOT fast-forward the cipher state. Empirical
-            // evidence (observe-only mode decrypts post-keyfile s->c cleanly
-            // starting from IV=0) shows that the server's s->c BF_cfb64
-            // game-key cipher is at IV=0 right when the keyfile lands.
-            // Whatever pre-keyfile s->c bytes the proxy forwarded to the
-            // client weren't part of that cipher stream (probably a separate
-            // handshake/greeting channel). If we fast-forward our cipher by
-            // those non-cipher bytes, our IV diverges from the server's.
+            // s->c handling: fast-forward the cipher pair by the pre-keyfile
+            // s->c bytes. These bytes were encrypted by the server's s->c
+            // game cipher and decrypted by the client's s->c game cipher —
+            // both real parties' IVs have advanced by exactly s2cPend.Length.
+            // To stay in sync we run the same bytes through our mirror
+            // ciphers in decrypt mode, discarding the plaintext (we don't
+            // need it; we already forwarded the raw bytes to the client).
             //
-            // So we leave the s->c game cipher pair at IV=0 and rely on the
-            // assumption that the client's s->c-decrypt is also at IV=0
-            // (consistent with observe-only's success). The pre-keyfile s->c
-            // bytes already reached the client unmodified.
+            // Earlier comment claimed "the s->c cipher is at IV=0 when the
+            // keyfile lands" — that's only true when no s->c bytes arrived
+            // pre-keyfile. When the keyfile takes 4-5s to capture (as is
+            // common on slow boxes), the server has already pushed 300-400
+            // s->c bytes, and the client has already advanced its decrypt
+            // IV by that much. Skipping the fast-forward leaves our mirror
+            // permanently out of sync and every injected packet decrypts
+            // to garbage on the client (visible as "stop walking" malformed
+            // s->c lines all session long).
             if (s2cPend != null && s2cPend.Length > 0)
             {
-                ProxyMain.Log("game", $"active: NOT fast-forwarding s->c ({s2cPend.Length} pre-key bytes treated as out-of-cipher-stream)");
+                ProxyMain.Log("game", $"active: fast-fwd s->c by {s2cPend.Length} pre-key bytes (server + client IVs advanced by this much before keyfile)");
+                lock (_activeUpstreamLock)   { var s = (byte[])s2cPend.Clone(); _upstreamGameCipher.DecryptS2c(s); }
+                lock (_activeDownstreamLock) { var s = (byte[])s2cPend.Clone(); _downstreamGameCipher.DecryptS2c(s); }
             }
             if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
             {
