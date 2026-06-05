@@ -1134,12 +1134,19 @@ namespace ConquerRevObserver
         // s2c-decrypt engine, used here in decrypt mode purely to track
         // CFB IV evolution). At injection time we'll clone the mirror's
         // state into a separate injector cipher.
+        // Pending one-shot plaintext substitution. When non-null, the next
+        // s->c chunk has its plaintext OVERWRITTEN (in part or whole) with
+        // _pendingSubstitution, then re-encrypted and forwarded. After
+        // application, this is cleared. The substitution starts at offset 0
+        // of the chunk's plaintext and runs for min(sub.Length, chunk.Length)
+        // bytes. Caller is responsible for ensuring the chunk is large enough.
+        private byte[] _pendingSubstitution;
+
         private void ActiveProcessS2c(byte[] chunk)
         {
             if (_upstreamGameCipher == null || _downstreamGameCipher == null) return;
 
-            // Decrypt copy for logging via the upstream cipher (mirrors the
-            // server's s->c-encrypt IV evolution).
+            // Decrypt with upstream (tracks server's s->c-encrypt IV).
             byte[] plaintext;
             lock (_activeUpstreamLock)
             {
@@ -1149,18 +1156,37 @@ namespace ConquerRevObserver
             WalkPackets(plaintext, "s->c");
             if (_activePlayerUid == 0) TryCaptureUidFromS2c(plaintext);
 
-            // Mirror: feed the same ciphertext through the downstream s2c
-            // engine in DECRYPT mode (we discard the output). This evolves
-            // the downstream s2c engine's IV identically to the client's
-            // s->c-decrypt cipher, so when we later inject a fake packet,
-            // we encrypt at the correct CFB position.
+            // Apply one-shot substitution if armed. Re-encrypt path is used
+            // ONLY for this chunk. After substitution, the session's s->c
+            // cipher stream diverges (server thinks IV=X, client now at IV=Y
+            // because we re-encrypted with downstream); subsequent real bytes
+            // forwarded unchanged will decode to garbage on the client. That
+            // is acceptable for a one-shot "fire the visual" demo.
+            byte[] sub = System.Threading.Interlocked.Exchange(ref _pendingSubstitution, null);
+            if (sub != null)
+            {
+                int n = System.Math.Min(sub.Length, plaintext.Length);
+                Buffer.BlockCopy(sub, 0, plaintext, 0, n);
+                ProxyMain.Log("inject", $"substituting {n}b of s->c plaintext, re-encrypting chunk ({chunk.Length}b) — session hosed after this");
+
+                byte[] outCipher;
+                lock (_activeDownstreamLock)
+                {
+                    outCipher = (byte[])plaintext.Clone();
+                    _downstreamGameCipher.EncryptS2c(outCipher);
+                }
+                try { _cs.Write(outCipher, 0, outCipher.Length); } catch { return; }
+                return;
+            }
+
+            // No substitution armed — also feed plaintext through downstream
+            // in DECRYPT mode so its IV stays locked to the client's (we
+            // still want this mirror tracking for parity with upstream).
             lock (_activeDownstreamLock)
             {
                 var mirrorScratch = (byte[])chunk.Clone();
                 _downstreamGameCipher.DecryptS2c(mirrorScratch);
             }
-
-            // Forward the original ciphertext to the client unmodified.
             try { _cs.Write(chunk, 0, chunk.Length); } catch { return; }
         }
 
@@ -1478,27 +1504,46 @@ namespace ConquerRevObserver
 
             if (m.Equals("@cyclone", StringComparison.OrdinalIgnoreCase))
             {
-                // Either auto-detected UID OR the --player-uid override is
-                // enough to fire the inject. SendFakeCycloneToClient will
-                // do its own no-uid check if both are zero.
                 if (_activePlayerUid == 0 && ProxyMain.OverridePlayerUid == 0)
                 {
                     ProxyMain.Log("inject", "@cyclone: no player UID known (auto-detect missed, no --player-uid override or @uid); skipping");
                     return;
                 }
-                if (_activeCycloneActive)
-                {
-                    ProxyMain.Log("inject", $"@cyclone: clearing fake StatusEffects (off, bit={ProxyMain.InjectEffectBit})");
-                    SendFakeCycloneToClient(false);
-                    _activeCycloneActive = false;
-                }
-                else
-                {
-                    ProxyMain.Log("inject", $"@cyclone: arming fake StatusEffects (on, bit={ProxyMain.InjectEffectBit})");
-                    SendFakeCycloneToClient(true);
-                    _activeCycloneActive = true;
-                }
+                bool enable = !_activeCycloneActive;
+                ArmCyclonePayloadSubstitution(enable);
+                _activeCycloneActive = enable;
+                ProxyMain.Log("inject", $"@cyclone: armed payload substitution (enable={enable}, bit={ProxyMain.InjectEffectBit}); will overwrite next s->c chunk");
             }
+        }
+
+        // Build the cyclone MsgUserAttrib plaintext and stash it as a one-shot
+        // substitution for the next s->c chunk. The substitution overlays the
+        // first N bytes of the next chunk's plaintext with our payload, then
+        // the rest of the chunk passes through. As long as the chunk is at
+        // least 32 bytes the payload fits cleanly; smaller chunks get a
+        // truncated payload (which the client will reject — but the cipher
+        // streams stay aligned because byte counts don't change).
+        private unsafe void ArmCyclonePayloadSubstitution(bool enable)
+        {
+            uint targetUid = ProxyMain.OverridePlayerUid != 0
+                ? ProxyMain.OverridePlayerUid
+                : _activePlayerUid;
+            ulong data = enable ? (1UL << ProxyMain.InjectEffectBit) : 0UL;
+            // 32 bytes total = 4 header + 20 body + 8 trailer (5065 PoC shape).
+            // Header: size=24, type=10017. Body: uid, count=1, type=25, data:u64.
+            var pkt = new byte[32];
+            fixed (byte* ptr = pkt)
+            {
+                *((ushort*)ptr) = (ushort)(pkt.Length - 8);
+                *((ushort*)(ptr + 2)) = ConquerPoc.Constants5517.MSG_UPDATE_LIKE;
+                *((uint*)(ptr + 4)) = targetUid;
+                *((uint*)(ptr + 8)) = 1;
+                *((uint*)(ptr + 12)) = ConquerPoc.Constants.UPDATE_TYPE_STATUS_EFFECTS;
+                *((ulong*)(ptr + 16)) = data;
+            }
+            var seal = System.Text.Encoding.ASCII.GetBytes("TQServer");
+            Buffer.BlockCopy(seal, 0, pkt, pkt.Length - 8, 8);
+            System.Threading.Interlocked.Exchange(ref _pendingSubstitution, pkt);
         }
 
         /// <summary>
