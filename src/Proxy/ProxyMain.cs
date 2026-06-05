@@ -1320,6 +1320,20 @@ namespace ConquerRevObserver
                         _activePlayerUid = BitConverter.ToUInt32(chunk, offset + 4);
                         ProxyMain.Log("game", $"active: captured player UID={_activePlayerUid} from MSG_CONNECT");
                     }
+                    else if (_activePlayerUid == 0 && total >= 8 &&
+                             (type == ConquerPoc.Constants5517.MSG_ACTION_LIKE ||
+                              type == ConquerPoc.Constants.MSG_ACTION))
+                    {
+                        // Fallback: MSG_CONNECT usually lands in the pre-keyfile
+                        // c->s window so we miss it. Every client MsgAction
+                        // carries the player's UID at body offset 0 (chr=...).
+                        uint uid = BitConverter.ToUInt32(chunk, offset + 4);
+                        if (uid != 0)
+                        {
+                            _activePlayerUid = uid;
+                            ProxyMain.Log("game", $"active: captured player UID={uid} from MSG_ACTION (c->s fallback)");
+                        }
+                    }
                     else if (type == ConquerPoc.Constants.MSG_TALK && total > 24)
                     {
                         // Body is at offset+4. After 20 bytes of header fields,
