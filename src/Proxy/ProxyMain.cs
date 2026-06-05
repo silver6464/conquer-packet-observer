@@ -876,34 +876,22 @@ namespace ConquerRevObserver
             // state. After this, all four of our streams' IVs match the
             // corresponding real party's IV at the same byte position,
             // and we can re-encrypt cleanly from here on.
-            if (s2cPend != null && s2cPend.Length > 0 && _activeKeyState != null)
+            // s->c handling: do NOT fast-forward the cipher state. Empirical
+            // evidence (observe-only mode decrypts post-keyfile s->c cleanly
+            // starting from IV=0) shows that the server's s->c BF_cfb64
+            // game-key cipher is at IV=0 right when the keyfile lands.
+            // Whatever pre-keyfile s->c bytes the proxy forwarded to the
+            // client weren't part of that cipher stream (probably a separate
+            // handshake/greeting channel). If we fast-forward our cipher by
+            // those non-cipher bytes, our IV diverges from the server's.
+            //
+            // So we leave the s->c game cipher pair at IV=0 and rely on the
+            // assumption that the client's s->c-decrypt is also at IV=0
+            // (consistent with observe-only's success). The pre-keyfile s->c
+            // bytes already reached the client unmodified.
+            if (s2cPend != null && s2cPend.Length > 0)
             {
-                ProxyMain.Log("game", $"active: fast-forwarding s->c ciphers by {s2cPend.Length} bytes");
-                // To advance any CFB-64 engine's IV state to match what the
-                // real party experienced after N ciphertext bytes, we must
-                // feed those same ciphertext bytes through the engine in
-                // DECRYPT mode. CFB-64's feedback is the INPUT byte (line
-                // 143 of BlowfishCfb64.ProcessBytes when encrypting=false),
-                // which equals the wire ciphertext. Encrypt mode would
-                // feed the OUTPUT byte instead, which would be a different
-                // (wrong) sequence and produce a divergent IV.
-                //
-                // We discard the decrypt output — it's noise; we only care
-                // about the resulting IV.
-                lock (_activeUpstreamLock)
-                {
-                    var scratch = (byte[])s2cPend.Clone();
-                    _upstreamGameCipher.DecryptS2c(scratch);
-                }
-                lock (_activeDownstreamLock)
-                {
-                    var scratch = (byte[])s2cPend.Clone();
-                    // Use the s2c-decrypt API even though this engine will
-                    // later be used for encrypt — same engine instance,
-                    // either mode evolves IV the same way given the same
-                    // ciphertext input.
-                    _downstreamGameCipher.DecryptS2c(scratch);
-                }
+                ProxyMain.Log("game", $"active: NOT fast-forwarding s->c ({s2cPend.Length} pre-key bytes treated as out-of-cipher-stream)");
             }
             if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
             {
