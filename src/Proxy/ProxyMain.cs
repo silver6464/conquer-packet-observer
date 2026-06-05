@@ -946,7 +946,36 @@ namespace ConquerRevObserver
                     && _activeKeyState.IvS2c != null;
                 if (haveSnapshot)
                 {
-                    ProxyMain.Log("game", $"active: s->c cipher pre-seeded from cfb snapshot (client processed {_activeKeyState.BytesS2c}b, num={_activeKeyState.NumS2c}); {s2cPend.Length} pre-key bytes intentionally NOT replayed");
+                    // The cipher is pre-seeded to the state AFTER the client
+                    // has consumed BytesS2c bytes. But the proxy buffered
+                    // s2cPend.Length bytes from the wire. The difference is
+                    // bytes that are in-flight (in the client's TCP socket
+                    // buffer / kernel buffer) and haven't yet been fed to
+                    // BF_cfb64 at snapshot time. The client WILL consume them
+                    // before any post-keyfile bytes, so we must advance our
+                    // cipher by exactly that delta to be aligned with what
+                    // the client decrypts next.
+                    long delta = (long)s2cPend.Length - _activeKeyState.BytesS2c;
+                    if (delta < 0)
+                    {
+                        // Client consumed MORE bytes than the proxy buffered.
+                        // Shouldn't happen — the proxy sees every byte going
+                        // toward the client. Log and continue at snapshot IV.
+                        ProxyMain.Log("game", $"active: s->c snapshot delta NEGATIVE (client={_activeKeyState.BytesS2c}b proxy={s2cPend.Length}b) — using snapshot IV as-is");
+                    }
+                    else if (delta == 0)
+                    {
+                        ProxyMain.Log("game", $"active: s->c cipher pre-seeded from cfb snapshot (client processed {_activeKeyState.BytesS2c}b, num={_activeKeyState.NumS2c}); no in-flight bytes");
+                    }
+                    else
+                    {
+                        // Advance our cipher by the in-flight tail of s2cPend.
+                        var tail = new byte[delta];
+                        Buffer.BlockCopy(s2cPend, (int)_activeKeyState.BytesS2c, tail, 0, (int)delta);
+                        lock (_activeUpstreamLock)   { var t = (byte[])tail.Clone(); _upstreamGameCipher.DecryptS2c(t); }
+                        lock (_activeDownstreamLock) { var t = (byte[])tail.Clone(); _downstreamGameCipher.DecryptS2c(t); }
+                        ProxyMain.Log("game", $"active: s->c snapshot at {_activeKeyState.BytesS2c}b, num={_activeKeyState.NumS2c}; advanced cipher by {delta}b in-flight tail (proxy buffered {s2cPend.Length}b total)");
+                    }
                 }
                 else
                 {
@@ -1008,31 +1037,47 @@ namespace ConquerRevObserver
                 else
                 {
                     // Buffer contains the full auth packet plus some post-auth
-                    // bytes. Fast-forward LOGIN by authEnd bytes; for GAME,
-                    // skip the fast-forward when we have a cfb snapshot in
-                    // the keyfile (the snapshot already encodes the client's
-                    // post-snapshot IV/num — re-running these bytes would
-                    // double-advance the IV).
+                    // bytes. Fast-forward LOGIN by authEnd bytes. For GAME:
+                    //  - With cfb snapshot: cipher is pre-seeded to AFTER the
+                    //    client consumed BytesC2s game-cipher bytes; advance
+                    //    by the in-flight delta (postAuth - BytesC2s).
+                    //  - Without cfb snapshot: run all postAuth bytes through.
                     int postAuth = c2sPend.Length - authEnd;
                     bool haveC2sSnapshot = _activeKeyState != null && _activeKeyState.IvC2s != null;
-                    if (haveC2sSnapshot)
-                    {
-                        ProxyMain.Log("game", $"active: c->s auth ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME pre-seeded from cfb snapshot (client processed {_activeKeyState.BytesC2s}b, num={_activeKeyState.NumC2s}); skip GAME replay of {postAuth}b");
-                    }
-                    else
-                    {
-                        ProxyMain.Log("game", $"active: c->s auth packet ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME by {postAuth}");
-                    }
                     var authPortion = new byte[authEnd];
                     Buffer.BlockCopy(c2sPend, 0, authPortion, 0, authEnd);
                     lock (_activeUpstreamLock)   { var s = (byte[])authPortion.Clone(); _upstreamLoginCipher.DecryptC2s(s); }
                     lock (_activeDownstreamLock) { var s = (byte[])authPortion.Clone(); _downstreamLoginCipher.DecryptC2s(s); }
-                    if (postAuth > 0 && !haveC2sSnapshot)
+                    if (haveC2sSnapshot)
                     {
-                        var postPortion = new byte[postAuth];
-                        Buffer.BlockCopy(c2sPend, authEnd, postPortion, 0, postAuth);
-                        lock (_activeUpstreamLock)   { var s = (byte[])postPortion.Clone(); _upstreamGameCipher.DecryptC2s(s); }
-                        lock (_activeDownstreamLock) { var s = (byte[])postPortion.Clone(); _downstreamGameCipher.DecryptC2s(s); }
+                        long delta = (long)postAuth - _activeKeyState.BytesC2s;
+                        if (delta < 0)
+                        {
+                            ProxyMain.Log("game", $"active: c->s snapshot delta NEGATIVE (client={_activeKeyState.BytesC2s}b proxy postAuth={postAuth}b) — using snapshot IV as-is");
+                        }
+                        else if (delta == 0)
+                        {
+                            ProxyMain.Log("game", $"active: c->s auth ends at offset {authEnd}; LOGIN fast-fwd {authEnd}b; GAME pre-seeded (client processed {_activeKeyState.BytesC2s}b, num={_activeKeyState.NumC2s}); no in-flight bytes");
+                        }
+                        else
+                        {
+                            var tail = new byte[delta];
+                            Buffer.BlockCopy(c2sPend, authEnd + (int)_activeKeyState.BytesC2s, tail, 0, (int)delta);
+                            lock (_activeUpstreamLock)   { var t = (byte[])tail.Clone(); _upstreamGameCipher.DecryptC2s(t); }
+                            lock (_activeDownstreamLock) { var t = (byte[])tail.Clone(); _downstreamGameCipher.DecryptC2s(t); }
+                            ProxyMain.Log("game", $"active: c->s auth ends at offset {authEnd}; LOGIN fast-fwd {authEnd}b; GAME snapshot at {_activeKeyState.BytesC2s}b, num={_activeKeyState.NumC2s}; advanced cipher by {delta}b in-flight tail");
+                        }
+                    }
+                    else
+                    {
+                        ProxyMain.Log("game", $"active: c->s auth packet ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME by {postAuth}");
+                        if (postAuth > 0)
+                        {
+                            var postPortion = new byte[postAuth];
+                            Buffer.BlockCopy(c2sPend, authEnd, postPortion, 0, postAuth);
+                            lock (_activeUpstreamLock)   { var s = (byte[])postPortion.Clone(); _upstreamGameCipher.DecryptC2s(s); }
+                            lock (_activeDownstreamLock) { var s = (byte[])postPortion.Clone(); _downstreamGameCipher.DecryptC2s(s); }
+                        }
                     }
                     // Skip the login-phase state machine entirely — we've
                     // already crossed the boundary during the fast-forward.
