@@ -55,7 +55,27 @@ const tryHook = function () {
     return true;
 };
 
-let captured = false;
+// Capture two schedules:
+//   - login (16-byte DR654) for the c->s auth packet phase
+//   - game  (64-byte DH-derived) for the post-auth game-key phase
+// We need BOTH because Rev's BF_set_key may produce a non-OpenSSL schedule;
+// computing DR654's schedule ourselves can be wrong. Capturing the actual
+// schedule the client uses sidesteps that whole question.
+const haveCaptured = { login: false, game: false };
+const captured = { login: null, game: null };
+let doneSent = false;
+
+const readSchedule = function (bfkey_ptr) {
+    const P = [];
+    for (let i = 0; i < 18; i++) {
+        P.push(bfkey_ptr.add(i * 4).readU32());
+    }
+    const S = [];
+    for (let i = 0; i < 1024; i++) {
+        S.push(bfkey_ptr.add(72 + i * 4).readU32());
+    }
+    return { P: P, S: S };
+};
 
 const installHooks = function () {
     const setKey = conquer.base.add(BF_SET_KEY_RVA);
@@ -67,28 +87,30 @@ const installHooks = function () {
             this.keylen   = args[1].toInt32();
         },
         onLeave: function (_retval) {
-            if (captured) return;
+            if (doneSent) return;
             if (!this.bfkey_ptr || this.bfkey_ptr.isNull()) return;
-            // Static DR654 key is 16 bytes — that's the login-port key, skip it.
-            // The game-port key is 64 bytes in the observed build, but defensively
-            // accept anything > 16.
-            if (this.keylen <= 16) return;
+
+            // Multiple BF_set_key calls per session — some are login key
+            // re-inits (16-byte DR654), the special one is the game key
+            // (64-byte). Capture each kind once.
+            const which = (this.keylen === 16) ? 'login' : (this.keylen > 16 ? 'game' : null);
+            if (which === null) return;
+            if (haveCaptured[which]) return;
 
             try {
-                // OpenSSL BF_KEY layout: BF_LONG P[18]; BF_LONG S[4][256];
-                // host-endian uint32. Total 4168 bytes.
-                const P = [];
-                for (let i = 0; i < 18; i++) {
-                    P.push(this.bfkey_ptr.add(i * 4).readU32());
-                }
-                const S = [];
-                for (let i = 0; i < 1024; i++) {
-                    S.push(this.bfkey_ptr.add(72 + i * 4).readU32());
-                }
-                captured = true;
-                console.log('[+] captured game BF_KEY  ptr=' + this.bfkey_ptr +
+                const sched = readSchedule(this.bfkey_ptr);
+                captured[which] = sched;
+                haveCaptured[which] = true;
+                console.log('[+] captured ' + which + ' BF_KEY  ptr=' + this.bfkey_ptr +
                             '  keylen=' + this.keylen);
-                send({ kind: 'done', p: P, s: S });
+                if (haveCaptured.login && haveCaptured.game && !doneSent) {
+                    doneSent = true;
+                    send({
+                        kind: 'done',
+                        login: { p: captured.login.P, s: captured.login.S },
+                        game:  { p: captured.game.P,  s: captured.game.S  },
+                    });
+                }
             } catch (e) {
                 console.error('  capture error: ' + e);
             }
@@ -119,12 +141,21 @@ def write_keyfile(payload, outdir):
     ts = time.strftime("%Y%m%d_%H%M%S")
     tmp = os.path.join(outdir, f"session_{ts}.json.tmp")
     final = os.path.join(outdir, f"session_{ts}.json")
-    # Schema (v2): single shared schedule, no per-direction split, no cutover.
-    # Proxy uses IV=00..00 in both directions on the first cfb64 call.
+    # Schema (v3): both DR654 login schedule and DH-derived game schedule.
+    # Backwards-compatible top-level p/s = game schedule for older proxy
+    # builds that expect a single schedule.
     doc = {
-        "version": 2,
-        "p": to_hex_array(payload["p"]),
-        "s": to_hex_array(payload["s"]),
+        "version": 3,
+        "login": {
+            "p": to_hex_array(payload["login"]["p"]),
+            "s": to_hex_array(payload["login"]["s"]),
+        },
+        "game": {
+            "p": to_hex_array(payload["game"]["p"]),
+            "s": to_hex_array(payload["game"]["s"]),
+        },
+        "p": to_hex_array(payload["game"]["p"]),
+        "s": to_hex_array(payload["game"]["s"]),
     }
     with open(tmp, "w") as f:
         json.dump(doc, f, indent=2)

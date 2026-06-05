@@ -503,8 +503,22 @@ namespace ConquerRevObserver
 
         private void DecodeC2s(GameKeyState state, byte[] backlog, byte[] freshChunk, string tag)
         {
+            // Prefer the Frida-captured DR654 schedule if available; falling
+            // back to deriving it from the ASCII key only works if Rev's
+            // BF_set_key matches OpenSSL exactly, which we cannot assume.
             if (_c2sLoginCipher == null)
-                _c2sLoginCipher = new GameCryptography(Common.ENCRYPTION_KEY);
+            {
+                if (state.LoginCrypto != null)
+                {
+                    _c2sLoginCipher = state.LoginCrypto;
+                    ProxyMain.Log("game", "c->s using Frida-captured DR654 schedule");
+                }
+                else
+                {
+                    _c2sLoginCipher = new GameCryptography(Common.ENCRYPTION_KEY);
+                    ProxyMain.Log("game", "c->s using self-derived DR654 schedule (no captured login key)");
+                }
+            }
 
             if (!_c2sGameKeyActive)
             {
@@ -1088,34 +1102,82 @@ namespace ConquerRevObserver
         public const int REV_LOGIN_PORT = 9959;
     }
 
-    // Holds the Frida-captured game-port BF_KEY schedule. Rev's client uses
-    // one shared schedule for both directions on 5817 (only IV/num differ),
-    // and the first cfb64 call after BF_set_key starts at IV=0. So:
-    //   - no cutover offset (decrypt from byte 0 of the 5817 stream)
-    //   - no per-direction IV (both directions start at IV=0)
-    //   - one P/S array, loaded into both engines
+    // Holds the Frida-captured BF_KEY schedules:
+    //   - game: post-DH 64-byte derived key, used for s->c entire stream and
+    //     for c->s after the auth packet.
+    //   - login: 16-byte DR654 schedule, used for the c->s auth packet.
+    // We capture LOGIN too rather than computing it from "DR654dt34trg4UI6"
+    // ourselves, because Rev's BF_set_key may produce a non-OpenSSL-compatible
+    // key schedule. Using the actual schedule the client uses guarantees a
+    // match.
     internal sealed class GameKeyState
     {
-        public GameCryptography Crypto;
+        public GameCryptography Crypto;       // game schedule (both dirs)
+        public GameCryptography LoginCrypto;  // DR654 schedule (c->s auth only)
 
         public static GameKeyState LoadFrom(string path)
         {
-            // session.json shape (v2):
+            // session.json v3:
             // {
-            //   "version": 2,
-            //   "p": [18 hex uint32],
-            //   "s": [1024 hex uint32]
+            //   "version": 3,
+            //   "login": { "p": [...], "s": [...] },
+            //   "game":  { "p": [...], "s": [...] },
+            //   "p": [...], "s": [...]   // back-compat alias for game
             // }
             string text = File.ReadAllText(path);
-            uint[] p = ParseUintArray(text, "p", 18);
-            uint[] s = ParseUintArray(text, "s", 1024);
+
+            string gameSection = ExtractObject(text, "game");
+            string loginSection = ExtractObject(text, "login");
+
+            uint[] gameP, gameS;
+            if (gameSection != null)
+            {
+                gameP = ParseUintArray(gameSection, "p", 18);
+                gameS = ParseUintArray(gameSection, "s", 1024);
+            }
+            else
+            {
+                // v2 fallback
+                gameP = ParseUintArray(text, "p", 18);
+                gameS = ParseUintArray(text, "s", 1024);
+            }
 
             var state = new GameKeyState
             {
-                Crypto = new GameCryptography(new byte[] { 0 }), // dummy init, replaced below
+                Crypto = new GameCryptography(new byte[] { 0 }),
             };
-            state.Crypto.LoadSchedules(p, s);
+            state.Crypto.LoadSchedules(gameP, gameS);
+
+            if (loginSection != null)
+            {
+                uint[] loginP = ParseUintArray(loginSection, "p", 18);
+                uint[] loginS = ParseUintArray(loginSection, "s", 1024);
+                state.LoginCrypto = new GameCryptography(new byte[] { 0 });
+                state.LoginCrypto.LoadSchedules(loginP, loginS);
+            }
+
             return state;
+        }
+
+        // Find {"...": { ... matching } } and return the inner section as a
+        // substring. Returns null if missing.
+        private static string ExtractObject(string text, string key)
+        {
+            int k = text.IndexOf("\"" + key + "\"");
+            if (k < 0) return null;
+            int open = text.IndexOf('{', k);
+            if (open < 0) return null;
+            int depth = 0;
+            for (int i = open; i < text.Length; i++)
+            {
+                if (text[i] == '{') depth++;
+                else if (text[i] == '}')
+                {
+                    depth--;
+                    if (depth == 0) return text.Substring(open + 1, i - open - 1);
+                }
+            }
+            return null;
         }
 
         private static uint[] ParseUintArray(string body, string key, int expectedLen)
