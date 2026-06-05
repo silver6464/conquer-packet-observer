@@ -41,6 +41,50 @@ namespace ConquerRevObserver
         public static string KeyfileDir { get; private set; } =
             System.IO.Path.Combine(AppContext.BaseDirectory, "captures", "keys");
 
+        /// <summary>
+        /// Operating mode for the 5817 game-port bridge.
+        ///   - ObserveOnly (default): forward ciphertext byte-for-byte between
+        ///     client and server, decrypt a copy locally for logging only.
+        ///     Cannot inject packets; cannot break the client/server connection.
+        ///   - ActiveMitM: maintain TWO independent cipher pairs (one for the
+        ///     server side, one for the client side), decrypt + re-encrypt
+        ///     each chunk. Enables injection of fabricated packets to the
+        ///     client (Phase 2 fake-visual test) at the cost of being able
+        ///     to corrupt the stream if cipher state drifts.
+        /// </summary>
+        public enum OperatingMode { ObserveOnly, ActiveMitM }
+
+        public static OperatingMode Mode { get; private set; } = OperatingMode.ObserveOnly;
+
+        /// <summary>
+        /// Override for the player UID used by fake-visual injection. 0 means
+        /// "auto-detect via MSG_CONNECT on the c->s stream"; non-zero means
+        /// "use this value regardless of what we see on the wire." Useful
+        /// when MSG_CONNECT was missed (e.g. arrived pre-keyfile) or when
+        /// you want to inject for a specific known character.
+        /// </summary>
+        public static uint OverridePlayerUid { get; private set; } = 0;
+
+        // Runtime setter so the in-game `@uid <N>` chat command can mutate
+        // this without a proxy restart. Not thread-safe by itself but the
+        // value is read on a single inject path with a stale-but-consistent
+        // read tolerated.
+        public static void SetOverridePlayerUid(uint uid) => OverridePlayerUid = uid;
+
+        /// <summary>
+        /// Which bit of the StatusEffects bitmask to set in the fake Update
+        /// packet. Default = 23 = "Tornado" on the live Rev 5187 client
+        /// (matches 5065's CLIENT_EFFECT_CYCLONE). Other cyc-related bits
+        /// per the live statuseffect.ini: 45 (cyclonecyc), 46
+        /// (cyclonehandcycle), 54 (Status_Stop_cyc), 59 (frost_cyc), 60
+        /// (chaos_cyc). Try different bits if bit 23 doesn't render the
+        /// expected visual.
+        /// </summary>
+        public static int InjectEffectBit { get; private set; } = 23;
+
+        // Runtime setter for the in-game `@bit <N>` chat command.
+        public static void SetInjectEffectBit(int bit) => InjectEffectBit = bit;
+
         public static void Main(string[] args)
         {
             for (int i = 0; i < args.Length; i++)
@@ -49,6 +93,31 @@ namespace ConquerRevObserver
                 {
                     KeyfileDir = args[++i];
                 }
+                else if (args[i] == "--mode" && i + 1 < args.Length)
+                {
+                    string v = args[++i].ToLowerInvariant();
+                    if (v == "observe-only" || v == "observe") Mode = OperatingMode.ObserveOnly;
+                    else if (v == "active-mitm" || v == "mitm") Mode = OperatingMode.ActiveMitM;
+                    else { Console.Error.WriteLine($"unknown --mode '{v}'; valid: observe-only | active-mitm"); System.Environment.Exit(2); }
+                }
+                else if (args[i] == "--player-uid" && i + 1 < args.Length)
+                {
+                    if (!uint.TryParse(args[++i], out var uid) || uid == 0)
+                    {
+                        Console.Error.WriteLine($"--player-uid expects a positive uint; got '{args[i]}'");
+                        System.Environment.Exit(2);
+                    }
+                    OverridePlayerUid = uid;
+                }
+                else if (args[i] == "--effect-bit" && i + 1 < args.Length)
+                {
+                    if (!int.TryParse(args[++i], out var bit) || bit < 0 || bit > 63)
+                    {
+                        Console.Error.WriteLine($"--effect-bit expects 0..63; got '{args[i]}'");
+                        System.Environment.Exit(2);
+                    }
+                    InjectEffectBit = bit;
+                }
             }
             Directory.CreateDirectory(KeyfileDir);
 
@@ -56,6 +125,20 @@ namespace ConquerRevObserver
             listener.Start();
             Log("proxy", $"SOCKS5 observer listening on 0.0.0.0:{LISTEN_PORT}");
             Log("proxy", $"Watching keyfile dir: {KeyfileDir}");
+            Log("proxy", $"Mode: {Mode}");
+            if (Mode == OperatingMode.ActiveMitM)
+            {
+                Log("proxy", "============================================================");
+                Log("proxy", " ACTIVE MitM MODE — proxy will RE-ENCRYPT both directions.");
+                Log("proxy", " Chat command '@cyclone' will fire a client-only fake visual");
+                Log("proxy", " injection test. Use only against operator-authorized servers.");
+                if (OverridePlayerUid != 0)
+                    Log("proxy", $" Inject target UID (override): {OverridePlayerUid}");
+                else
+                    Log("proxy", $" Inject target UID: auto-detect from MSG_CONNECT");
+                Log("proxy", $" Inject effect bit: {InjectEffectBit} (data = 1 << {InjectEffectBit})");
+                Log("proxy", "============================================================");
+            }
             Log("proxy", "Configure Proxifier: Proxy Server type=SOCKS5, host=<this machine's Tailscale IP>, port=1080");
             Log("proxy", "Then a Proxification Rule: match Conquer.exe -> action: that proxy server");
 
@@ -193,20 +276,19 @@ namespace ConquerRevObserver
                 _cs.ReadTimeout = Timeout.Infinite;
                 _ss.ReadTimeout = Timeout.Infinite;
 
-                // Game port (5817): two modes.
-                //   - Keyfile mode: a Frida-captured session.json is in KeyfileDir, OR
-                //     will arrive while this connection is alive. We do NOT attempt
-                //     MitM-DH. Forward bytes untouched. When the keyfile appears, the
-                //     pumps start decrypting locally — they don't re-encrypt because
-                //     we're matched 1:1 with the client's cipher state, so the server
-                //     never sees a proxy.
-                //   - DH mode: legacy path that tries to mediate the handshake itself.
-                //     Kept for environments where the schedule isn't being captured.
-                // Other ports: raw passthrough.
+                // Game port (5817): dispatch by operating mode. Other ports
+                // (login, etc.) always raw-passthrough.
                 if (_destPort == ProxyMainPorts.REV_GAME_PORT)
-                    BridgeGameObserveOnly();
+                {
+                    if (ProxyMain.Mode == ProxyMain.OperatingMode.ActiveMitM)
+                        BridgeGameActiveMitM();
+                    else
+                        BridgeGameObserveOnly();
+                }
                 else
+                {
                     BridgeRaw();
+                }
             }
             catch (Exception e)
             {
@@ -599,6 +681,14 @@ namespace ConquerRevObserver
             WalkPackets(combined, tag);
         }
 
+        private static byte[] Concat(byte[] a, byte[] b)
+        {
+            var r = new byte[a.Length + b.Length];
+            Buffer.BlockCopy(a, 0, r, 0, a.Length);
+            Buffer.BlockCopy(b, 0, r, a.Length, b.Length);
+            return r;
+        }
+
         private static int IndexOf(byte[] haystack, byte[] needle)
         {
             for (int i = 0; i + needle.Length <= haystack.Length; i++)
@@ -652,6 +742,787 @@ namespace ConquerRevObserver
                 }
                 catch { }
                 Thread.Sleep(200);
+            }
+        }
+
+        // ============================================================
+        // Game port (5817), ACTIVE-MITM mode (Phase 2).
+        //
+        // Unlike observe-only mode, here the proxy maintains TWO independent
+        // cipher pairs (one for the server side, one for the client side),
+        // each loaded from the same Frida-captured schedules:
+        //
+        //   _upstreamGameCipher    — encrypts c->s for the server; decrypts s->c from the server
+        //   _downstreamGameCipher  — encrypts s->c for the client;  decrypts c->s from the client
+        //   _upstreamLoginCipher   — DR654 for c->s auth phase, server side
+        //   _downstreamLoginCipher — DR654 for c->s auth phase, client side
+        //
+        // Every chunk gets:
+        //   c->s: decrypt with downstream, walk packets (log + chat-command sniff), re-encrypt with upstream, write to server
+        //   s->c: decrypt with upstream,   walk packets (log),                       re-encrypt with downstream, write to client
+        //
+        // Injection (Phase 2 fake-visual): build a plaintext s->c packet,
+        // serialize on the downstream-encrypt lock with the s->c pump, encrypt
+        // it with _downstreamGameCipher, write to client. The client's CFB
+        // state advances by the injected packet's length — but so does the
+        // proxy's downstream-encrypt cipher, so subsequent real server bytes
+        // re-encrypted to the client stay aligned with what the client
+        // expects. The server never sees the injection.
+        // ============================================================
+        private GameKeyState _activeKeyState;           // shared schedule source (same as observe-only)
+        // True once ActiveFlushBacklogsOnce has finished fast-forwarding the
+        // cipher states. Until then, live ActiveMitmPump chunks are buffered
+        // (not processed) so they can't run through the cipher engines at
+        // the wrong IV state and corrupt alignment.
+        private volatile bool _activeFastFwdDone;
+        private GameCryptography _upstreamGameCipher;
+        private GameCryptography _downstreamGameCipher;
+        private GameCryptography _upstreamLoginCipher;
+        private GameCryptography _downstreamLoginCipher;
+        private readonly object _activeUpstreamLock = new object();
+        private readonly object _activeDownstreamLock = new object();
+
+        // c->s key-transition state for active MitM (parallel to observe-only's
+        // _c2sGameKeyActive but for both directions of the c->s pipe).
+        private bool _activeC2sGameKeyActive;
+        private readonly MemoryStream _activeC2sRawAccum = new MemoryStream();
+        private readonly MemoryStream _activeC2sShadowDecrypted = new MemoryStream();
+
+        // Pre-keyfile backlog buffers (same idea as observe-only).
+        private readonly MemoryStream _activeS2cPending = new MemoryStream();
+        private readonly MemoryStream _activeC2sPending = new MemoryStream();
+        private readonly object _activePendingLock = new object();
+
+        // Captured player UID, used by injection. Read from MSG_CONNECT (1052)
+        // post-auth, which contains the player's UID in body bytes 0..3.
+        private uint _activePlayerUid;
+
+        // One-shot guard: only allow one fake-visual injection per @cyclone trigger.
+        // Set when an injection fires, cleared when the trigger arrives again.
+        private bool _activeCycloneActive;
+
+        private void BridgeGameActiveMitM()
+        {
+            ProxyMain.Log("game", "active-mitm mode: re-encrypting both directions, watching for keyfile");
+
+            Task.Run(() => KeyfileWatcher());
+
+            var sToC = Task.Run(() => ActiveMitmPump(_ss, _cs, "s->c", isServerToClient: true));
+            var cToS = Task.Run(() => ActiveMitmPump(_cs, _ss, "c->s", isServerToClient: false));
+
+            Task.Run(() => ActiveFlushBacklogsOnce());
+
+            Task.WaitAny(sToC, cToS);
+        }
+
+        // Once the keyfile arrives, instantiate the four cipher engines and
+        // drain any backlog through them. Called from a background task.
+        private void ActiveOnKeyfileLoaded()
+        {
+            if (_activeKeyState != null) return; // already done
+            // _keyState is what KeyfileWatcher writes — we share that state.
+            var ks = _keyState;
+            if (ks == null) return;
+
+            // Re-derive both cipher pairs from the same schedules. ks.Crypto
+            // and ks.LoginCrypto each hold ONE pair (used by observe-only for
+            // local decryption); we need TWO pairs total for active MitM, so
+            // build fresh GameCryptography instances from the raw schedules
+            // we have in ks.Crypto / ks.LoginCrypto by re-loading them.
+            // Trick: GameKeyState.LoadFrom stored the P/S arrays into Crypto
+            // and LoginCrypto via LoadSchedules — but we don't have direct
+            // access to the arrays afterward. Re-read the keyfile from disk.
+            // (Could be cached, but reloading is simple and runs once.)
+            string keyPath = FindLoadedKeyfilePath();
+            if (keyPath == null)
+            {
+                ProxyMain.Log("game", "WARN: keyfile loaded but path lost; injection disabled");
+                _activeKeyState = ks; // still set so pumps can decrypt via ks.Crypto
+                return;
+            }
+
+            try
+            {
+                var ksUpstream = GameKeyState.LoadFrom(keyPath);
+                var ksDownstream = GameKeyState.LoadFrom(keyPath);
+                _upstreamGameCipher    = ksUpstream.Crypto;
+                _upstreamLoginCipher   = ksUpstream.LoginCrypto;
+                _downstreamGameCipher  = ksDownstream.Crypto;
+                _downstreamLoginCipher = ksDownstream.LoginCrypto;
+                _activeKeyState = ks;
+                ProxyMain.Log("game", "active-mitm cipher pairs initialized");
+            }
+            catch (Exception e)
+            {
+                ProxyMain.Log("game", $"failed to init active-mitm ciphers: {e.Message}");
+            }
+        }
+
+        // The KeyfileWatcher renamed the consumed file to .used. Find it.
+        private string FindLoadedKeyfilePath()
+        {
+            try
+            {
+                var files = Directory.GetFiles(ProxyMain.KeyfileDir, "session_*.json.used");
+                if (files.Length == 0) return null;
+                Array.Sort(files, (a, b) => File.GetLastWriteTimeUtc(b).CompareTo(File.GetLastWriteTimeUtc(a)));
+                return files[0];
+            }
+            catch { return null; }
+        }
+
+        private void ActiveFlushBacklogsOnce()
+        {
+            while (_keyState == null) Thread.Sleep(50);
+            ActiveOnKeyfileLoaded();
+
+            // Drain in a loop: snapshot the pending buffers, fast-forward
+            // both ciphers, then check whether the pumps wrote more bytes
+            // during the fast-forward. We only mark _activeFastFwdDone once
+            // both pending buffers are empty after a drain — that means no
+            // more pre-key bytes can land. The pumps stay in "buffer +
+            // forward raw" mode until we flip the flag, so the cipher
+            // engines aren't touched concurrently.
+            byte[] c2sPend = null;
+            byte[] s2cPend = null;
+            int pass = 0;
+            while (true)
+            {
+                bool empty;
+                lock (_activePendingLock)
+                {
+                    if (_activeC2sPending.Length > 0)
+                    {
+                        var add = _activeC2sPending.ToArray();
+                        _activeC2sPending.SetLength(0);
+                        c2sPend = c2sPend == null ? add : Concat(c2sPend, add);
+                    }
+                    if (_activeS2cPending.Length > 0)
+                    {
+                        var add = _activeS2cPending.ToArray();
+                        _activeS2cPending.SetLength(0);
+                        s2cPend = s2cPend == null ? add : Concat(s2cPend, add);
+                    }
+                    // Inside the lock, mark fast-forward done IF the pending
+                    // buffers are empty right now. The pumps check the flag
+                    // before writing to pending — combined with this lock,
+                    // no new bytes can be added between us setting the flag
+                    // and the pumps starting to process bytes live.
+                    empty = _activeC2sPending.Length == 0 && _activeS2cPending.Length == 0;
+                    if (empty) _activeFastFwdDone = true;
+                }
+                if (empty) break;
+                pass++;
+                if (pass > 10)
+                {
+                    ProxyMain.Log("game", "active: too many fast-fwd passes; bailing");
+                    break;
+                }
+                // Brief sleep to let pumps drain to the buffers; then re-check.
+                Thread.Sleep(20);
+            }
+
+            // Fast-forward the cipher pairs by running the accumulated
+            // pre-keyfile ciphertext through each of the four CFB streams.
+            // We discard the output and care only about the resulting IV
+            // state. After this, all four of our streams' IVs match the
+            // corresponding real party's IV at the same byte position,
+            // and we can re-encrypt cleanly from here on.
+            // s->c handling: do NOT fast-forward the cipher state. Empirical
+            // evidence (observe-only mode decrypts post-keyfile s->c cleanly
+            // starting from IV=0) shows that the server's s->c BF_cfb64
+            // game-key cipher is at IV=0 right when the keyfile lands.
+            // Whatever pre-keyfile s->c bytes the proxy forwarded to the
+            // client weren't part of that cipher stream (probably a separate
+            // handshake/greeting channel). If we fast-forward our cipher by
+            // those non-cipher bytes, our IV diverges from the server's.
+            //
+            // So we leave the s->c game cipher pair at IV=0 and rely on the
+            // assumption that the client's s->c-decrypt is also at IV=0
+            // (consistent with observe-only's success). The pre-keyfile s->c
+            // bytes already reached the client unmodified.
+            if (s2cPend != null && s2cPend.Length > 0)
+            {
+                ProxyMain.Log("game", $"active: NOT fast-forwarding s->c ({s2cPend.Length} pre-key bytes treated as out-of-cipher-stream)");
+            }
+            if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
+            {
+                // The c->s pre-keyfile buffer almost always straddles the
+                // DR654→game-key boundary: the first ~170 bytes are the
+                // single DR654-encrypted auth packet ending in "TQClient",
+                // everything after is game-key. We must fast-forward the
+                // LOGIN cipher state by exactly the auth bytes and the
+                // GAME cipher state by exactly the post-auth bytes,
+                // otherwise post-keyfile c->s decryption is garbled.
+                int authEnd = -1;
+                try
+                {
+                    string keyPath = FindLoadedKeyfilePath();
+                    if (keyPath != null)
+                    {
+                        var freshKs = GameKeyState.LoadFrom(keyPath);
+                        var shadow = (byte[])c2sPend.Clone();
+                        freshKs.LoginCrypto.DecryptC2s(shadow);
+                        int trailerIdx = IndexOf(shadow, TQ_CLIENT_TRAILER_ACTIVE);
+                        if (trailerIdx >= 0)
+                        {
+                            authEnd = trailerIdx + TQ_CLIENT_TRAILER_ACTIVE.Length;
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    ProxyMain.Log("game", $"active: c->s boundary scan failed: {e.Message}");
+                }
+
+                if (authEnd < 0)
+                {
+                    // Auth packet doesn't end in this buffer — entire buffer
+                    // is DR654. Fast-forward LOGIN ciphers only.
+                    ProxyMain.Log("game", $"active: fast-fwd c->s LOGIN by {c2sPend.Length} bytes (no trailer in buffer)");
+                    lock (_activeUpstreamLock)   { var s = (byte[])c2sPend.Clone(); _upstreamLoginCipher.DecryptC2s(s); }
+                    lock (_activeDownstreamLock) { var s = (byte[])c2sPend.Clone(); _downstreamLoginCipher.DecryptC2s(s); }
+                    _activeC2sRawAccum.Write(c2sPend, 0, c2sPend.Length);
+                    // Build the side-shadow for later trailer scan as before.
+                    try
+                    {
+                        string keyPath = FindLoadedKeyfilePath();
+                        if (keyPath != null)
+                        {
+                            var freshKs = GameKeyState.LoadFrom(keyPath);
+                            var shadow = (byte[])c2sPend.Clone();
+                            freshKs.LoginCrypto.DecryptC2s(shadow);
+                            _activeC2sShadowDecrypted.Write(shadow, 0, shadow.Length);
+                        }
+                    }
+                    catch { }
+                }
+                else
+                {
+                    // Buffer contains the full auth packet plus some post-auth
+                    // bytes. Fast-forward LOGIN by authEnd bytes, GAME by the
+                    // remainder, and mark c->s game-key active.
+                    int postAuth = c2sPend.Length - authEnd;
+                    ProxyMain.Log("game", $"active: c->s auth packet ends at offset {authEnd}; fast-fwd LOGIN by {authEnd}, GAME by {postAuth}");
+                    var authPortion = new byte[authEnd];
+                    Buffer.BlockCopy(c2sPend, 0, authPortion, 0, authEnd);
+                    lock (_activeUpstreamLock)   { var s = (byte[])authPortion.Clone(); _upstreamLoginCipher.DecryptC2s(s); }
+                    lock (_activeDownstreamLock) { var s = (byte[])authPortion.Clone(); _downstreamLoginCipher.DecryptC2s(s); }
+                    if (postAuth > 0)
+                    {
+                        var postPortion = new byte[postAuth];
+                        Buffer.BlockCopy(c2sPend, authEnd, postPortion, 0, postAuth);
+                        lock (_activeUpstreamLock)   { var s = (byte[])postPortion.Clone(); _upstreamGameCipher.DecryptC2s(s); }
+                        lock (_activeDownstreamLock) { var s = (byte[])postPortion.Clone(); _downstreamGameCipher.DecryptC2s(s); }
+                    }
+                    // Skip the login-phase state machine entirely — we've
+                    // already crossed the boundary during the fast-forward.
+                    _activeC2sGameKeyActive = true;
+                    ProxyMain.Log("game", "active: c->s game-key mode active (skipped login-phase state machine)");
+                }
+            }
+        }
+
+        private void ActiveMitmPump(NetworkStream from, NetworkStream to, string tag, bool isServerToClient)
+        {
+            var buf = new byte[8192];
+            int chunkIdx = 0;
+            while (true)
+            {
+                int n;
+                try { n = from.Read(buf, 0, buf.Length); }
+                catch { return; }
+                if (n <= 0) return;
+
+                var chunk = new byte[n];
+                Buffer.BlockCopy(buf, 0, chunk, 0, n);
+                CaptureChunk(chunk, n, isServerToClient, chunkIdx++);
+
+                if (_activeKeyState == null || !_activeFastFwdDone)
+                {
+                    // Two cases collapsed into one:
+                    //   1) Keyfile not loaded yet — buffer + forward raw.
+                    //   2) Keyfile loaded but fast-forward not finished —
+                    //      buffer + forward raw; we cannot run these bytes
+                    //      through our cipher engines yet or alignment
+                    //      breaks (the engines are still at IV=0 while the
+                    //      real parties are at IV=N).
+                    //
+                    // In both cases we accumulate the ciphertext bytes so
+                    // that fast-forward processes EVERY byte that flowed
+                    // before our ciphers are ready, and forward unmodified
+                    // bytes so the client/server connection stays alive.
+                    lock (_activePendingLock)
+                    {
+                        var pending = isServerToClient ? _activeS2cPending : _activeC2sPending;
+                        pending.Write(chunk, 0, n);
+                    }
+                    try { to.Write(chunk, 0, n); } catch { return; }
+                    continue;
+                }
+
+                if (isServerToClient)
+                {
+                    ActiveProcessS2c(chunk);
+                }
+                else
+                {
+                    ActiveProcessC2s(chunk);
+                }
+            }
+        }
+
+        // HYBRID MODE: s->c is observe-only at the wire level. We decrypt a
+        // copy of the chunk for logging, but FORWARD THE ORIGINAL CIPHERTEXT
+        // UNMODIFIED to the client. The client's s->c-decrypt cipher state
+        // and the server's s->c-encrypt cipher state stay locked to each
+        // other naturally — the proxy stays out of the loop.
+        //
+        // To enable one-shot injection later, we also feed the same wire
+        // ciphertext through a "mirror" cipher (_downstreamGameCipher's
+        // s2c-decrypt engine, used here in decrypt mode purely to track
+        // CFB IV evolution). At injection time we'll clone the mirror's
+        // state into a separate injector cipher.
+        private void ActiveProcessS2c(byte[] chunk)
+        {
+            if (_upstreamGameCipher == null || _downstreamGameCipher == null) return;
+
+            // Decrypt copy for logging via the upstream cipher (mirrors the
+            // server's s->c-encrypt IV evolution).
+            byte[] plaintext;
+            lock (_activeUpstreamLock)
+            {
+                plaintext = (byte[])chunk.Clone();
+                _upstreamGameCipher.DecryptS2c(plaintext);
+            }
+            WalkPackets(plaintext, "s->c");
+
+            // Mirror: feed the same ciphertext through the downstream s2c
+            // engine in DECRYPT mode (we discard the output). This evolves
+            // the downstream s2c engine's IV identically to the client's
+            // s->c-decrypt cipher, so when we later inject a fake packet,
+            // we encrypt at the correct CFB position.
+            lock (_activeDownstreamLock)
+            {
+                var mirrorScratch = (byte[])chunk.Clone();
+                _downstreamGameCipher.DecryptS2c(mirrorScratch);
+            }
+
+            // Forward the original ciphertext to the client unmodified.
+            try { _cs.Write(chunk, 0, chunk.Length); } catch { return; }
+        }
+
+        // c->s: decrypt with downstream cipher (which the *client* uses to
+        // encrypt outbound), walk packets (and sniff @cyclone trigger),
+        // re-encrypt with upstream cipher, forward to server.
+        // Handles the DR654 auth handoff identically to DecodeC2s in
+        // observe-only mode.
+        private void ActiveProcessC2s(byte[] freshChunk)
+        {
+            if (_downstreamGameCipher == null || _upstreamGameCipher == null) return;
+            if (_downstreamLoginCipher == null || _upstreamLoginCipher == null) return;
+
+            // Phase: are we still in DR654 auth territory or have we crossed
+            // the TQClient trailer boundary into game-key territory?
+            if (!_activeC2sGameKeyActive)
+            {
+                ActiveC2sLoginPhase(freshChunk);
+                return;
+            }
+
+            // Steady state: game key both ways.
+            byte[] plaintext;
+            lock (_activeDownstreamLock)
+            {
+                plaintext = (byte[])freshChunk.Clone();
+                _downstreamGameCipher.DecryptC2s(plaintext);
+            }
+            // Inspect plaintext for @cyclone trigger before re-encrypting.
+            InspectC2sForCommands(plaintext);
+            WalkPackets(plaintext, "c->s");
+
+            lock (_activeUpstreamLock)
+            {
+                var outbound = (byte[])plaintext.Clone();
+                // c->s encrypt path on the upstream cipher. CFB encrypt
+                // mirrors what the real client did with its own cipher.
+                _upstreamGameCipher.EncryptC2s(outbound);
+                try { _ss.Write(outbound, 0, outbound.Length); } catch { return; }
+            }
+        }
+
+        // Auth-phase c->s: decrypt with the DR654 schedule, scan for the
+        // "TQClient" trailer (which marks the end of the single DR654-encrypted
+        // auth packet), then switch to game-key mode. Same algorithm as
+        // observe-only's DecodeC2s, but here we also re-encrypt for upstream.
+        private static readonly byte[] TQ_CLIENT_TRAILER_ACTIVE =
+            new byte[] { 0x54, 0x51, 0x43, 0x6C, 0x69, 0x65, 0x6E, 0x74 };
+
+        private void ActiveC2sLoginPhase(byte[] freshChunk)
+        {
+            // Decrypt the fresh chunk with DR654 (downstream side), accumulate
+            // both the raw and decrypted bytes so we can find the trailer.
+            _activeC2sRawAccum.Write(freshChunk, 0, freshChunk.Length);
+            byte[] copy;
+            lock (_activeDownstreamLock)
+            {
+                copy = (byte[])freshChunk.Clone();
+                _downstreamLoginCipher.DecryptC2s(copy);
+            }
+            _activeC2sShadowDecrypted.Write(copy, 0, copy.Length);
+
+            byte[] decrypted = _activeC2sShadowDecrypted.ToArray();
+            int trailerIdx = IndexOf(decrypted, TQ_CLIENT_TRAILER_ACTIVE);
+            if (trailerIdx < 0)
+            {
+                // Still in auth packet; we don't have the boundary yet. We
+                // CANNOT forward to the server yet because we haven't
+                // re-encrypted under the upstream's DR654. Do it now: take
+                // the raw bytes we just received, run them through
+                // _upstreamLoginCipher's encrypt path, write to server.
+                lock (_activeUpstreamLock)
+                {
+                    var outbound = (byte[])freshChunk.Clone();
+                    _upstreamLoginCipher.EncryptC2s(outbound);
+                    try { _ss.Write(outbound, 0, outbound.Length); } catch { return; }
+                }
+                return;
+            }
+
+            int authPacketEnd = trailerIdx + TQ_CLIENT_TRAILER_ACTIVE.Length;
+            ProxyMain.Log("game", $"active: c->s auth (DR654) ended at offset {authPacketEnd}");
+
+            // Emit the auth packet for logging.
+            var authPlain = new byte[authPacketEnd];
+            Buffer.BlockCopy(decrypted, 0, authPlain, 0, authPacketEnd);
+            WalkPackets(authPlain, "c->s [auth]");
+
+            // Re-encrypt and forward the auth packet to the upstream server.
+            // Some of these bytes may have already been re-encrypted+forwarded
+            // in earlier ActiveC2sLoginPhase calls (the "still in auth packet"
+            // branch above). We forward only the NEW portion of this chunk
+            // up to authPacketEnd (in shadow-buffer coordinates); everything
+            // after authPacketEnd is post-auth and gets game-key treatment.
+            byte[] rawAll = _activeC2sRawAccum.ToArray();
+            // raw bytes that haven't been forwarded yet = the part of this
+            // freshChunk that we held back. Since we forwarded each prior
+            // chunk fully in the "still in auth" branch, the only bytes
+            // unwritten are those in THIS chunk. The boundary inside this
+            // chunk = authPacketEnd minus the count of bytes accumulated
+            // BEFORE this chunk.
+            int priorAccumLen = decrypted.Length - freshChunk.Length;
+            int boundaryInChunk = authPacketEnd - priorAccumLen;
+            if (boundaryInChunk < 0) boundaryInChunk = 0;
+            if (boundaryInChunk > freshChunk.Length) boundaryInChunk = freshChunk.Length;
+
+            // Forward the auth portion of this chunk (still DR654-encrypted
+            // for upstream).
+            if (boundaryInChunk > 0)
+            {
+                var authPortion = new byte[boundaryInChunk];
+                Buffer.BlockCopy(freshChunk, 0, authPortion, 0, boundaryInChunk);
+                lock (_activeUpstreamLock)
+                {
+                    _upstreamLoginCipher.EncryptC2s(authPortion);
+                    try { _ss.Write(authPortion, 0, authPortion.Length); } catch { return; }
+                }
+            }
+
+            // Switch to game key. Post-auth raw bytes within this chunk get
+            // the game-key treatment for both directions.
+            _activeC2sGameKeyActive = true;
+            int postAuthLen = freshChunk.Length - boundaryInChunk;
+            if (postAuthLen > 0)
+            {
+                var postAuthRaw = new byte[postAuthLen];
+                Buffer.BlockCopy(freshChunk, boundaryInChunk, postAuthRaw, 0, postAuthLen);
+                // Decrypt with downstream game cipher.
+                byte[] postPlain;
+                lock (_activeDownstreamLock)
+                {
+                    postPlain = (byte[])postAuthRaw.Clone();
+                    _downstreamGameCipher.DecryptC2s(postPlain);
+                }
+                InspectC2sForCommands(postPlain);
+                WalkPackets(postPlain, "c->s");
+
+                // Re-encrypt with upstream game cipher and forward to server.
+                lock (_activeUpstreamLock)
+                {
+                    var outbound = (byte[])postPlain.Clone();
+                    _upstreamGameCipher.EncryptC2s(outbound);
+                    try { _ss.Write(outbound, 0, outbound.Length); } catch { return; }
+                }
+            }
+
+            // Free the shadow buffers — done with the DR654 phase.
+            _activeC2sRawAccum.SetLength(0);
+            _activeC2sShadowDecrypted.SetLength(0);
+        }
+
+        // Walk c->s plaintext looking for things the proxy reacts to:
+        //   - MSG_CONNECT (1052): grab the player's UID for use in injection.
+        //   - MSG_TALK (1004) with body containing "@cyclone": fire the fake
+        //     visual injection. The chat message is NOT modified — it still
+        //     reaches the server normally.
+        private unsafe void InspectC2sForCommands(byte[] chunk)
+        {
+            fixed (byte* basePtr = chunk)
+            {
+                int offset = 0;
+                int safety = 0;
+                while (offset + 4 <= chunk.Length && safety++ < 64)
+                {
+                    ushort size = *((ushort*)(basePtr + offset));
+                    ushort type = *((ushort*)(basePtr + offset + 2));
+                    int total = size + 8;
+                    if (total <= 0 || total > chunk.Length - offset) return;
+                    if (size == 0 && type == 0) return;
+
+                    if (type == ConquerPoc.Constants.MSG_CONNECT && _activePlayerUid == 0 && total >= 8)
+                    {
+                        _activePlayerUid = BitConverter.ToUInt32(chunk, offset + 4);
+                        ProxyMain.Log("game", $"active: captured player UID={_activePlayerUid} from MSG_CONNECT");
+                    }
+                    else if (type == ConquerPoc.Constants.MSG_TALK && total > 24)
+                    {
+                        // Body is at offset+4. After 20 bytes of header fields,
+                        // NetStringPacker entries begin: [count:u8][len:u8][bytes]...
+                        // Speaker is first, hearer second, target third, message
+                        // fourth (usually). Look at message contents for triggers.
+                        string msg = ExtractTalkMessage(chunk, offset, total);
+                        if (msg != null)
+                        {
+                            HandleChatCommand(msg);
+                        }
+                    }
+
+                    offset += total;
+                }
+            }
+        }
+
+        private static string ExtractTalkMessage(byte[] chunk, int packetOff, int total)
+        {
+            // body at packetOff+4. Skip 20 bytes of fixed fields, then NetStrings.
+            int bodyOff = packetOff + 4;
+            int nsOff = bodyOff + 20;
+            int remaining = total - 24 - 8; // exclude header + fixed + trailer
+            if (remaining < 1) return null;
+            int count = chunk[nsOff]; nsOff++; remaining--;
+            string lastString = null;
+            for (int i = 0; i < count && remaining > 0; i++)
+            {
+                int n = chunk[nsOff]; nsOff++; remaining--;
+                if (n > remaining) break;
+                lastString = System.Text.Encoding.UTF8.GetString(chunk, nsOff, n);
+                nsOff += n; remaining -= n;
+            }
+            return lastString;
+        }
+
+        private void HandleChatCommand(string message)
+        {
+            if (message == null) return;
+            string m = message.Trim();
+
+            // NOTE: these chat commands are still forwarded to the server
+            // (the proxy doesn't currently swallow them — that would require
+            // modifying the c->s plaintext buffer before re-encryption,
+            // which is fiddly). The server's chat log WILL show the player
+            // typing `@uid`, `@bit`, `@cyclone`, etc. Use a private channel
+            // or Whisper-to-self if you don't want spectators to see them.
+
+            // @uid <N>  — set the override player UID (live, no restart). Mirrors
+            //             --player-uid. Useful for testing without restarting
+            //             the proxy. Setting 0 reverts to auto-detect.
+            if (m.StartsWith("@uid ", StringComparison.OrdinalIgnoreCase))
+            {
+                string arg = m.Substring(5).Trim();
+                if (uint.TryParse(arg, out var uid))
+                {
+                    ProxyMain.SetOverridePlayerUid(uid);
+                    ProxyMain.Log("cmd", $"@uid: override UID set to {uid}");
+                }
+                else
+                {
+                    ProxyMain.Log("cmd", $"@uid: bad arg '{arg}' (expected uint)");
+                }
+                return;
+            }
+
+            // @bit <N>  — set the StatusEffects bit to flip in the injected
+            //             Update. 0..63. Mirrors --effect-bit.
+            if (m.StartsWith("@bit ", StringComparison.OrdinalIgnoreCase))
+            {
+                string arg = m.Substring(5).Trim();
+                if (int.TryParse(arg, out var bit) && bit >= 0 && bit <= 63)
+                {
+                    ProxyMain.SetInjectEffectBit(bit);
+                    ProxyMain.Log("cmd", $"@bit: effect bit set to {bit} (data = 1 << {bit} = 0x{(1UL << bit):X16})");
+                }
+                else
+                {
+                    ProxyMain.Log("cmd", $"@bit: bad arg '{arg}' (expected 0..63)");
+                }
+                return;
+            }
+
+            // @status — print current override values without firing anything.
+            if (m.Equals("@status", StringComparison.OrdinalIgnoreCase))
+            {
+                ProxyMain.Log("cmd", $"@status: override UID={ProxyMain.OverridePlayerUid}, auto UID={_activePlayerUid}, effect bit={ProxyMain.InjectEffectBit}");
+                return;
+            }
+
+            if (m.Equals("@cyclone", StringComparison.OrdinalIgnoreCase))
+            {
+                // Either auto-detected UID OR the --player-uid override is
+                // enough to fire the inject. SendFakeCycloneToClient will
+                // do its own no-uid check if both are zero.
+                if (_activePlayerUid == 0 && ProxyMain.OverridePlayerUid == 0)
+                {
+                    ProxyMain.Log("inject", "@cyclone: no player UID known (auto-detect missed, no --player-uid override or @uid); skipping");
+                    return;
+                }
+                if (_activeCycloneActive)
+                {
+                    ProxyMain.Log("inject", $"@cyclone: clearing fake StatusEffects (off, bit={ProxyMain.InjectEffectBit})");
+                    SendFakeCycloneToClient(false);
+                    _activeCycloneActive = false;
+                }
+                else
+                {
+                    ProxyMain.Log("inject", $"@cyclone: arming fake StatusEffects (on, bit={ProxyMain.InjectEffectBit})");
+                    SendFakeCycloneToClient(true);
+                    _activeCycloneActive = true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Inject a fabricated MSG_UPDATE(StatusEffects) packet to the client only.
+        /// The server never sees this. If the client renders the visual, we've
+        /// demonstrated that proxy-level visual spoofing still works on Rev 5517.
+        ///
+        /// Packet layout. 5065 had MSG_UPDATE=1017 with a 20-byte body
+        /// (uid:4 count:4 updateType:4 data:8). Rev 5517 uses type=10017
+        /// and the real packets on the wire are 44 bytes total (32-byte
+        /// body), so there are 12 extra bytes somewhere — fields the new
+        /// build added that we haven't reverse-engineered. We zero-pad the
+        /// tail to match the observed on-wire size; if the client validates
+        /// the size strictly, our fake at the old 32-byte length would be
+        /// rejected silently.
+        ///
+        ///   [0..1]   size = 36 (packet length minus 8)
+        ///   [2..3]   type = 10017
+        ///   [4..7]   UID
+        ///   [8..11]  count = 1
+        ///   [12..15] UpdateType = 26 (StatusEffects in 5065 — value may
+        ///                          have moved in 5517; verify against
+        ///                          a real Update packet's updateType field)
+        ///   [16..23] Data = 64-bit ClientEffect bitmask (bit 23 = Cyclone in 5065)
+        ///   [24..35] padding (12 bytes of zeros)
+        ///   [36..43] "TQServer" trailer
+        ///
+        /// Two unknowns remain that could explain the visual not rendering:
+        ///   - UpdateType 26 may not be StatusEffects on 5517.
+        ///   - Bit 23 may not be Cyclone on 5517.
+        /// Cross-check by triggering Cyclone normally and watching the
+        /// s->c [Update? #10017] body for the updateType / data values.
+        /// </summary>
+        private unsafe void SendFakeCycloneToClient(bool enable)
+        {
+            if (_downstreamGameCipher == null || _activeKeyState == null)
+            {
+                ProxyMain.Log("inject", "WARN: ciphers not ready; cannot inject");
+                return;
+            }
+            // Resolve the target UID: CLI override takes precedence over the
+            // auto-captured one from MSG_CONNECT. This is the escape hatch for
+            // when MSG_CONNECT arrived pre-keyfile and capture missed it.
+            uint targetUid = ProxyMain.OverridePlayerUid != 0
+                ? ProxyMain.OverridePlayerUid
+                : _activePlayerUid;
+            if (targetUid == 0)
+            {
+                ProxyMain.Log("inject", "WARN: no player UID known (MSG_CONNECT missed and no --player-uid override); skipping");
+                return;
+            }
+
+            ulong data = enable ? (1UL << ProxyMain.InjectEffectBit) : 0UL;
+            // 44 bytes total: 4 header + 32 body + 8 trailer. Body matches
+            // the size of real Rev 5517 MsgUserAttrib (#10017) packets seen
+            // on the wire.
+            var pkt = new byte[44];
+            fixed (byte* ptr = pkt)
+            {
+                *((ushort*)ptr) = (ushort)(pkt.Length - 8);
+                *((ushort*)(ptr + 2)) = ConquerPoc.Constants5517.MSG_UPDATE_LIKE;
+                *((uint*)(ptr + 4)) = targetUid;
+                *((uint*)(ptr + 8)) = 1;
+                *((uint*)(ptr + 12)) = ConquerPoc.Constants.UPDATE_TYPE_STATUS_EFFECTS;
+                *((ulong*)(ptr + 16)) = data;
+                // [24..35] already zero. The 12 trailing body bytes are
+                // unknown — we'll need to capture a real Update(StatusEffects)
+                // for this build to find out what (if anything) goes here.
+            }
+            // Trailer (the client validates this).
+            var seal = System.Text.Encoding.ASCII.GetBytes("TQServer");
+            Buffer.BlockCopy(seal, 0, pkt, pkt.Length - 8, 8);
+
+            // Log plaintext (for confirmation it's well-formed).
+            var hex = new StringBuilder();
+            for (int i = 0; i < pkt.Length; i++) hex.Append(pkt[i].ToString("X2")).Append(' ');
+            ProxyMain.Log("inject", $"fake StatusEffects pkt plaintext: {hex}");
+
+            // Build a fresh "injector" cipher whose schedule is the captured
+            // game key. Clone the current s2c-decrypt CFB state from the
+            // mirror (_downstreamGameCipher) into it — the mirror's IV
+            // tracks the client's s->c-decrypt IV because we've been feeding
+            // every real server byte through it in decrypt mode.
+            //
+            // Encrypt the fake packet with the injector. The output is
+            // ciphertext that will decrypt cleanly on the client at its
+            // current IV.
+            //
+            // IMPORTANT: after this injection, the client's s->c-decrypt IV
+            // has advanced by 44 bytes processing our fake. The server's
+            // s->c-encrypt IV has NOT advanced (server didn't send anything).
+            // The streams are now misaligned and all future real server
+            // bytes will decrypt to garbage on the client. The session is
+            // effectively hosed after one injection. This is acceptable for
+            // a one-shot "yes, the visual renders" test.
+            var injector = new GameCryptography(new byte[] { 0 });
+            try
+            {
+                string keyPath = FindLoadedKeyfilePath();
+                if (keyPath == null) { ProxyMain.Log("inject", "WARN: keyfile path lost; cannot inject"); return; }
+                var fresh = GameKeyState.LoadFrom(keyPath);
+                // The injector's s2c-decrypt engine has the captured schedule
+                // (from LoadSchedules) with IV=0. Overlay the mirror's CFB
+                // state on top so it picks up where the client is now.
+                lock (_activeDownstreamLock)
+                {
+                    _downstreamGameCipher.CopyS2cStateInto(fresh.Crypto);
+                }
+                fresh.Crypto.EncryptS2c(pkt);
+            }
+            catch (Exception e)
+            {
+                ProxyMain.Log("inject", $"failed to build injector: {e.Message}");
+                return;
+            }
+
+            try
+            {
+                _cs.Write(pkt, 0, pkt.Length);
+                ProxyMain.Log("inject", $"sent fake UpdatePacket(StatusEffects=0x{data:X16}, bit={ProxyMain.InjectEffectBit}) to client UID={targetUid}");
+                ProxyMain.Log("inject", "post-inject: client's s->c IV is now 44 bytes ahead of server's; subsequent real bytes will garble. Session is effectively hosed.");
+            }
+            catch (Exception e)
+            {
+                ProxyMain.Log("inject", $"failed to send fake packet: {e.Message}");
             }
         }
 
