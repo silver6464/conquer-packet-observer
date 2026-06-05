@@ -24,9 +24,26 @@ namespace ConquerPoc.Packets
         }
 
         // Wiki-canonical names. Source: conquer-wiki/Packets/Packets.md.
-        // Where multiple wiki patch versions exist for the same ID, the
-        // Layout field flags the one we expect on Rev 5187 (closest match
-        // wins on body-size).
+        //
+        // Rev "5187" version analysis (from wire-vs-wiki triangulation
+        // 2026-06-05). The version number 5187 implies a base around patch
+        // 5165, but in practice each packet family is at its own patch
+        // level — Rev is a Frankenstein build with selectively backported
+        // upgrades. Per-packet confirmed layouts:
+        //
+        //   MsgConnect  (1052) ............ patch 5615 (body=24, has build+lang+mac)
+        //   MsgUserInfo (1006) ............ patch 5165 (body=102, matches name="dandruff" exactly)
+        //   MsgInteract (1022) ............ patch 5017 (body=24, our InteractPacket struct)
+        //   MsgAction   (10010, LONG)...... ~patch 5165, body=28 — chr-id at offset 4
+        //                                    (5615-style placement), 5165 size
+        //   MsgAction   (10010, SHORT)..... empirical, body=24 — server-side acks
+        //   MsgWalk     (10005) ........... ~patch 5517-stripped, body=12 (dir+uid+ts only)
+        //   MsgUserAttrib (10017) ......... patch 5672 (body=32, has 3 value fields)
+        //   MsgPlayer   (10014) ........... between patch 5103 and 5672 (body=142),
+        //                                    no exact wiki match — body customized
+        //
+        // The Layout tags below mark the wiki patch we used as the parsing
+        // reference. "rev" means we don't have a wiki match — Rev-custom shape.
         private static readonly Dictionary<ushort, Entry> KNOWN = new Dictionary<ushort, Entry>
         {
             { 1001, new Entry { Id=1001, Name="MsgRegister" } },
@@ -128,10 +145,10 @@ namespace ConquerPoc.Packets
             // Renumbered IDs on Rev 5187 (also patch 5103 era per the wiki).
             // Body layouts match their 1000s-range counterparts at the same
             // patch level.
-            { 10005, new Entry { Id=10005, Name="MsgWalk" } },
-            { 10010, new Entry { Id=10010, Name="MsgAction", Layout="patch5517" } },
-            { 10014, new Entry { Id=10014, Name="MsgPlayer" } },
-            { 10017, new Entry { Id=10017, Name="MsgUserAttrib", Layout="patch5672" } },
+            { 10005, new Entry { Id=10005, Name="MsgWalk",       Layout="rev (stripped 5517: dir/uid/ts only)" } },
+            { 10010, new Entry { Id=10010, Name="MsgAction",     Layout="patch5165 (chr-id at body offset 0, sz=40 LONG / sz=36 SHORT)" } },
+            { 10014, new Entry { Id=10014, Name="MsgPlayer",     Layout="rev (between 5103 and 5672, body=142)" } },
+            { 10017, new Entry { Id=10017, Name="MsgUserAttrib", Layout="patch5672 (body=32, uid/cnt/status/v1/v2/v3)" } },
         };
 
         public static Entry Lookup(ushort id)
