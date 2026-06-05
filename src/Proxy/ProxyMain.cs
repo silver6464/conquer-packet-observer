@@ -629,6 +629,14 @@ namespace ConquerRevObserver
             WalkPackets(combined, tag);
         }
 
+        private static byte[] Concat(byte[] a, byte[] b)
+        {
+            var r = new byte[a.Length + b.Length];
+            Buffer.BlockCopy(a, 0, r, 0, a.Length);
+            Buffer.BlockCopy(b, 0, r, a.Length, b.Length);
+            return r;
+        }
+
         private static int IndexOf(byte[] haystack, byte[] needle)
         {
             for (int i = 0; i + needle.Length <= haystack.Length; i++)
@@ -710,6 +718,11 @@ namespace ConquerRevObserver
         // expects. The server never sees the injection.
         // ============================================================
         private GameKeyState _activeKeyState;           // shared schedule source (same as observe-only)
+        // True once ActiveFlushBacklogsOnce has finished fast-forwarding the
+        // cipher states. Until then, live ActiveMitmPump chunks are buffered
+        // (not processed) so they can't run through the cipher engines at
+        // the wrong IV state and corrupt alignment.
+        private volatile bool _activeFastFwdDone;
         private GameCryptography _upstreamGameCipher;
         private GameCryptography _downstreamGameCipher;
         private GameCryptography _upstreamLoginCipher;
@@ -811,20 +824,50 @@ namespace ConquerRevObserver
             while (_keyState == null) Thread.Sleep(50);
             ActiveOnKeyfileLoaded();
 
+            // Drain in a loop: snapshot the pending buffers, fast-forward
+            // both ciphers, then check whether the pumps wrote more bytes
+            // during the fast-forward. We only mark _activeFastFwdDone once
+            // both pending buffers are empty after a drain — that means no
+            // more pre-key bytes can land. The pumps stay in "buffer +
+            // forward raw" mode until we flip the flag, so the cipher
+            // engines aren't touched concurrently.
             byte[] c2sPend = null;
             byte[] s2cPend = null;
-            lock (_activePendingLock)
+            int pass = 0;
+            while (true)
             {
-                if (_activeC2sPending.Length > 0)
+                bool empty;
+                lock (_activePendingLock)
                 {
-                    c2sPend = _activeC2sPending.ToArray();
-                    _activeC2sPending.SetLength(0);
+                    if (_activeC2sPending.Length > 0)
+                    {
+                        var add = _activeC2sPending.ToArray();
+                        _activeC2sPending.SetLength(0);
+                        c2sPend = c2sPend == null ? add : Concat(c2sPend, add);
+                    }
+                    if (_activeS2cPending.Length > 0)
+                    {
+                        var add = _activeS2cPending.ToArray();
+                        _activeS2cPending.SetLength(0);
+                        s2cPend = s2cPend == null ? add : Concat(s2cPend, add);
+                    }
+                    // Inside the lock, mark fast-forward done IF the pending
+                    // buffers are empty right now. The pumps check the flag
+                    // before writing to pending — combined with this lock,
+                    // no new bytes can be added between us setting the flag
+                    // and the pumps starting to process bytes live.
+                    empty = _activeC2sPending.Length == 0 && _activeS2cPending.Length == 0;
+                    if (empty) _activeFastFwdDone = true;
                 }
-                if (_activeS2cPending.Length > 0)
+                if (empty) break;
+                pass++;
+                if (pass > 10)
                 {
-                    s2cPend = _activeS2cPending.ToArray();
-                    _activeS2cPending.SetLength(0);
+                    ProxyMain.Log("game", "active: too many fast-fwd passes; bailing");
+                    break;
                 }
+                // Brief sleep to let pumps drain to the buffers; then re-check.
+                Thread.Sleep(20);
             }
 
             // Fast-forward the cipher pairs by running the accumulated
@@ -955,26 +998,20 @@ namespace ConquerRevObserver
                 Buffer.BlockCopy(buf, 0, chunk, 0, n);
                 CaptureChunk(chunk, n, isServerToClient, chunkIdx++);
 
-                if (_activeKeyState == null)
+                if (_activeKeyState == null || !_activeFastFwdDone)
                 {
-                    // Key not ready yet. Two simultaneous requirements:
-                    //   1) The client and server are talking and we can't
-                    //      stall the connection or the client times out.
-                    //   2) We need our four CFB streams to eventually
-                    //      align with the real client+server states.
+                    // Two cases collapsed into one:
+                    //   1) Keyfile not loaded yet — buffer + forward raw.
+                    //   2) Keyfile loaded but fast-forward not finished —
+                    //      buffer + forward raw; we cannot run these bytes
+                    //      through our cipher engines yet or alignment
+                    //      breaks (the engines are still at IV=0 while the
+                    //      real parties are at IV=N).
                     //
-                    // Solution: forward the bytes unmodified (clients and
-                    // servers continue to communicate), AND accumulate the
-                    // ciphertext bytes per direction. When the keyfile
-                    // arrives, we'll fast-forward each cipher state by
-                    // running the accumulated bytes through it. CFB-64's
-                    // IV state after N bytes is a function of just the
-                    // ciphertext that flowed; same ciphertext goes into
-                    // the feedback IV in both encrypt and decrypt modes
-                    // (see BlowfishCfb64.ProcessBytes), so once we replay
-                    // the buffered bytes through each of our four streams,
-                    // every stream's IV matches the corresponding real
-                    // party's IV. Re-encryption from that point is clean.
+                    // In both cases we accumulate the ciphertext bytes so
+                    // that fast-forward processes EVERY byte that flowed
+                    // before our ciphers are ready, and forward unmodified
+                    // bytes so the client/server connection stays alive.
                     lock (_activePendingLock)
                     {
                         var pending = isServerToClient ? _activeS2cPending : _activeC2sPending;
