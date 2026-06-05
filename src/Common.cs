@@ -41,6 +41,7 @@ namespace ConquerPoc
         public const ushort MSG_CONNECT = 1052;
         public const ushort MSG_UPDATE = 1017;
         public const ushort MSG_SPAWN_ENTITY = 1014;
+        public const ushort MSG_USER_INFO = 1006;
 
         // 9-direction delta tables matching Redux/Common.cs:22-23.
         // Conquer movement directions: 0=N, 1=NW, 2=W, 3=SW, 4=S, 5=SE, 6=E, 7=NE, 8=stay.

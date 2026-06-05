@@ -1096,6 +1096,7 @@ namespace ConquerRevObserver
                 _upstreamGameCipher.DecryptS2c(plaintext);
             }
             WalkPackets(plaintext, "s->c");
+            if (_activePlayerUid == 0) TryCaptureUidFromS2c(plaintext);
 
             // Mirror: feed the same ciphertext through the downstream s2c
             // engine in DECRYPT mode (we discard the output). This evolves
@@ -1265,6 +1266,41 @@ namespace ConquerRevObserver
         //   - MSG_TALK (1004) with body containing "@cyclone": fire the fake
         //     visual injection. The chat message is NOT modified — it still
         //     reaches the server normally.
+
+        // Fallback UID capture: MSG_CONNECT often lands in the pre-keyfile
+        // c->s window, so the c->s scanner misses it. MsgUserInfo (1006) is
+        // always post-keyfile and post-handshake on s->c, and its body offset
+        // 0 is the player's UID under the patch 5165 layout. Walk packets
+        // here only to grab that UID — no command handling.
+        private unsafe void TryCaptureUidFromS2c(byte[] chunk)
+        {
+            fixed (byte* basePtr = chunk)
+            {
+                int offset = 0;
+                int safety = 0;
+                while (offset + 4 <= chunk.Length && safety++ < 64)
+                {
+                    ushort size = *((ushort*)(basePtr + offset));
+                    ushort type = *((ushort*)(basePtr + offset + 2));
+                    int total = size + 8;
+                    if (total <= 0 || total > chunk.Length - offset) return;
+                    if (size == 0 && type == 0) return;
+
+                    if (type == ConquerPoc.Constants.MSG_USER_INFO && total >= 12)
+                    {
+                        uint uid = BitConverter.ToUInt32(chunk, offset + 4);
+                        if (uid != 0)
+                        {
+                            _activePlayerUid = uid;
+                            ProxyMain.Log("game", $"active: captured player UID={uid} from MSG_USER_INFO (s->c fallback)");
+                            return;
+                        }
+                    }
+                    offset += total;
+                }
+            }
+        }
+
         private unsafe void InspectC2sForCommands(byte[] chunk)
         {
             fixed (byte* basePtr = chunk)
