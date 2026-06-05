@@ -836,19 +836,30 @@ namespace ConquerRevObserver
             if (s2cPend != null && s2cPend.Length > 0 && _activeKeyState != null)
             {
                 ProxyMain.Log("game", $"active: fast-forwarding s->c ciphers by {s2cPend.Length} bytes");
-                // Server's s->c encrypt state → our upstream s2c-decrypt
-                // (both end up with the same IV after processing the same ciphertext).
+                // To advance any CFB-64 engine's IV state to match what the
+                // real party experienced after N ciphertext bytes, we must
+                // feed those same ciphertext bytes through the engine in
+                // DECRYPT mode. CFB-64's feedback is the INPUT byte (line
+                // 143 of BlowfishCfb64.ProcessBytes when encrypting=false),
+                // which equals the wire ciphertext. Encrypt mode would
+                // feed the OUTPUT byte instead, which would be a different
+                // (wrong) sequence and produce a divergent IV.
+                //
+                // We discard the decrypt output — it's noise; we only care
+                // about the resulting IV.
                 lock (_activeUpstreamLock)
                 {
                     var scratch = (byte[])s2cPend.Clone();
                     _upstreamGameCipher.DecryptS2c(scratch);
                 }
-                // Client's s->c decrypt state → our downstream s2c-encrypt
-                // (same logic: same ciphertext bytes evolve IV identically).
                 lock (_activeDownstreamLock)
                 {
                     var scratch = (byte[])s2cPend.Clone();
-                    _downstreamGameCipher.EncryptS2c(scratch);
+                    // Use the s2c-decrypt API even though this engine will
+                    // later be used for encrypt — same engine instance,
+                    // either mode evolves IV the same way given the same
+                    // ciphertext input.
+                    _downstreamGameCipher.DecryptS2c(scratch);
                 }
             }
             if (c2sPend != null && c2sPend.Length > 0 && _activeKeyState != null)
@@ -864,10 +875,14 @@ namespace ConquerRevObserver
                 // we'll see garbage c->s decryption — flag it later if it
                 // happens. Most pre-keyfile c->s is the auth packet anyway.
                 ProxyMain.Log("game", $"active: fast-forwarding c->s LOGIN ciphers by {c2sPend.Length} bytes (may include game-key tail)");
+                // Same reasoning as the s->c block above: feed ciphertext
+                // through DECRYPT mode so the engine's feedback IV evolves
+                // from the wire ciphertext byte (not the freshly-generated
+                // encrypted-of-ciphertext byte).
                 lock (_activeUpstreamLock)
                 {
                     var scratch = (byte[])c2sPend.Clone();
-                    _upstreamLoginCipher.EncryptC2s(scratch);
+                    _upstreamLoginCipher.DecryptC2s(scratch);
                 }
                 lock (_activeDownstreamLock)
                 {
