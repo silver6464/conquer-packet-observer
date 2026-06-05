@@ -857,6 +857,15 @@ namespace ConquerRevObserver
                         ProxyMain.Log("pkt", $"{dir} type={type} total={total} [malformed, stop walking]");
                         return;
                     }
+                    // Heuristic: an all-zero "packet" (size=0, type=0) means we've
+                    // walked into a zero-padded region (typical inside a #2685
+                    // ACReport body whose tail is nearly-all-zero). Real TQ
+                    // packets always have a non-zero type. Stop silently rather
+                    // than flooding the log with one entry per 8 zero bytes.
+                    if (size == 0 && type == 0)
+                    {
+                        return;
+                    }
                     string formatted = ConquerPoc.Packets.PacketPrinter.Format(chunk, offset, total, type);
                     ProxyMain.Log("pkt", $"{dir} {formatted}");
                     offset += total;

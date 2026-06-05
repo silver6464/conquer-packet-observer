@@ -58,8 +58,13 @@ namespace ConquerPoc.Packets
             switch (type)
             {
                 case 1004: return ParseTalk(chunk, bodyStart, bodyLen);
-                case 1005:
-                case 10005: return ParseWalk(chunk, bodyStart, bodyLen);
+                case 1005: return ParseWalk5065(chunk, bodyStart, bodyLen);
+                // 10005 Walk body layout on Rev 5517 is NOT the same as 5065
+                // (5065 expected uid:u32 dir:u8 mode:u8 at body offset 0,
+                // but Rev 5517 puts something else there — the values we
+                // read as dir/mode are out of range). Parking parsing
+                // until we figure out the real layout; fall through to hex.
+                case 10005: return null;
                 case 1010:
                 case 10010: return ParseGeneralData(chunk, bodyStart, bodyLen);
                 case 1014:
@@ -93,9 +98,9 @@ namespace ConquerPoc.Packets
                 : $"{{ ch={channel} <{speaker}>->{hearer} {Q(text)} }}";
         }
 
-        // MSG_WALK (1005 / 10005): uid:u32, dir:u8, mode:u8, [direction-specific bytes]
-        // 5517 renumbered to 10005 — body shape is best-effort.
-        private static string ParseWalk(byte[] b, int off, int len)
+        // MSG_WALK (5065 #1005): uid:u32, dir:u8, mode:u8. Rev 5517's #10005
+        // uses a different body layout — not parsed (see TryParseBody switch).
+        private static string ParseWalk5065(byte[] b, int off, int len)
         {
             if (len < 6) return null;
             uint uid = ReadU32(b, off);

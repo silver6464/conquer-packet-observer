@@ -32,8 +32,9 @@ namespace ConquerPoc.Packets
         {
             { 1001, "Register" },         { 1004, "Talk" },              { 1005, "Walk" },
             { 1006, "HeroInformation" },  { 1008, "ItemInformation" },   { 1009, "ItemAction" },
-            { 1010, "GeneralData" },      { 1014, "SpawnEntity" },       { 1015, "Strings" },
-            { 1017, "Update" },           { 1019, "Associate" },         { 1022, "Interact" },
+            { 1010, "GeneralData" },      { 1012, "AccountSpawn" },      { 1014, "SpawnEntity" },
+            { 1015, "Strings" },          { 1017, "Update" },            { 1019, "Associate" },
+            { 1022, "Interact" },
             { 1023, "TeamInteraction" },  { 1024, "AssignAttributes" },  { 1025, "WeaponProf" },
             { 1026, "TeamMemberInfo" },   { 1027, "SocketGem" },         { 1032, "Action2" },
             { 1033, "ServerTime" },       { 1052, "Connect" },           { 1055, "AuthResponse" },
@@ -62,8 +63,6 @@ namespace ConquerPoc.Packets
             // Rev-specific anti-cheat packet: large (763 bytes), high zero-padding,
             // ASCII hex blob at start. Not a gameplay packet.
             { 2685, "ACReport" },
-            // Connect-related response on the new build (not seen elsewhere yet)
-            { 1012, "LoginResponse?" },
         };
 
         public static Entry Lookup(ushort id)
