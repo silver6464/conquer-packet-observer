@@ -946,36 +946,23 @@ namespace ConquerRevObserver
                     && _activeKeyState.IvS2c != null;
                 if (haveSnapshot)
                 {
-                    // The cipher is pre-seeded to the state AFTER the client
-                    // has consumed BytesS2c bytes. But the proxy buffered
-                    // s2cPend.Length bytes from the wire. The difference is
-                    // bytes that are in-flight (in the client's TCP socket
-                    // buffer / kernel buffer) and haven't yet been fed to
-                    // BF_cfb64 at snapshot time. The client WILL consume them
-                    // before any post-keyfile bytes, so we must advance our
-                    // cipher by exactly that delta to be aligned with what
-                    // the client decrypts next.
+                    // The cipher is pre-seeded to the EXACT state the client's
+                    // BF_cfb64 is at when Frida snapshotted. We do NOT advance
+                    // the cipher by buffered-but-undecrypted bytes — empirical
+                    // result (session 2026-06-06 01:01:48): the previous
+                    // "advance by in-flight tail" attempt left s->c garbled.
+                    // The likely cause: the proxy's pre-keyfile s2cPend buffer
+                    // contains bytes the client has either (a) not yet pulled
+                    // from its socket buffer at snapshot time but will fully
+                    // consume next, OR (b) bytes that flowed through some
+                    // out-of-cipher channel (TLS handshake-ish prelude before
+                    // BF_cfb64 takes over). When the v3 keyfile path used IV=0
+                    // and skipped these bytes, s->c decoded cleanly — meaning
+                    // (b) is the right model: those bytes aren't in the cipher
+                    // stream and our snapshot already represents the cipher's
+                    // current position.
                     long delta = (long)s2cPend.Length - _activeKeyState.BytesS2c;
-                    if (delta < 0)
-                    {
-                        // Client consumed MORE bytes than the proxy buffered.
-                        // Shouldn't happen — the proxy sees every byte going
-                        // toward the client. Log and continue at snapshot IV.
-                        ProxyMain.Log("game", $"active: s->c snapshot delta NEGATIVE (client={_activeKeyState.BytesS2c}b proxy={s2cPend.Length}b) — using snapshot IV as-is");
-                    }
-                    else if (delta == 0)
-                    {
-                        ProxyMain.Log("game", $"active: s->c cipher pre-seeded from cfb snapshot (client processed {_activeKeyState.BytesS2c}b, num={_activeKeyState.NumS2c}); no in-flight bytes");
-                    }
-                    else
-                    {
-                        // Advance our cipher by the in-flight tail of s2cPend.
-                        var tail = new byte[delta];
-                        Buffer.BlockCopy(s2cPend, (int)_activeKeyState.BytesS2c, tail, 0, (int)delta);
-                        lock (_activeUpstreamLock)   { var t = (byte[])tail.Clone(); _upstreamGameCipher.DecryptS2c(t); }
-                        lock (_activeDownstreamLock) { var t = (byte[])tail.Clone(); _downstreamGameCipher.DecryptS2c(t); }
-                        ProxyMain.Log("game", $"active: s->c snapshot at {_activeKeyState.BytesS2c}b, num={_activeKeyState.NumS2c}; advanced cipher by {delta}b in-flight tail (proxy buffered {s2cPend.Length}b total)");
-                    }
+                    ProxyMain.Log("game", $"active: s->c cipher pre-seeded from cfb snapshot (client processed {_activeKeyState.BytesS2c}b, num={_activeKeyState.NumS2c}); {s2cPend.Length} pre-key bytes proxy-buffered, delta={delta}b NOT replayed (delta bytes assumed out-of-cipher-stream)");
                 }
                 else
                 {
