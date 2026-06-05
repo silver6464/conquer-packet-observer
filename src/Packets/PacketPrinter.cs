@@ -134,6 +134,11 @@ namespace ConquerPoc.Packets
         // updateType:u32 at 12-15, data:u64 at 16-23. Rev 5517 has 12 extra
         // bytes of body we don't yet understand — show their hex so we
         // can reverse-engineer the layout from observed packets.
+        //
+        // When data != 0 we ALSO dump the entire body as a hex blob and
+        // tag the bit positions set in `data`. The latter lets us spot
+        // which status-effect bits a real packet sets (per the live
+        // statuseffect.ini bit-shift mapping).
         private static string ParseUpdate(byte[] b, int off, int len)
         {
             if (len < 12) return null;
@@ -150,7 +155,25 @@ namespace ConquerPoc.Packets
                 for (int i = 0; i < dumpLen; i++) sb.Append(b[off + 24 + i].ToString("X2"));
                 tail = $" extra[{extra}b]={sb}";
             }
-            return $"{{ uid={uid} count={count} updateType={upd} data=0x{data:X16}{tail} }}";
+            string bitTag = "";
+            if (data != 0)
+            {
+                var bits = new System.Collections.Generic.List<int>();
+                for (int i = 0; i < 64; i++) if ((data & (1UL << i)) != 0) bits.Add(i);
+                bitTag = $" bits={string.Join(",", bits)}";
+            }
+            string fullBody = "";
+            if (data != 0 && len > 0)
+            {
+                // Full body hex dump (useful for capturing a ground-truth
+                // Update(StatusEffects) packet's exact bytes). Only print
+                // when data != 0 to avoid noise on the constant idle
+                // updateType=100 traffic.
+                var sb = new StringBuilder();
+                for (int i = 0; i < len; i++) sb.Append(b[off + i].ToString("X2"));
+                fullBody = $" body={sb}";
+            }
+            return $"{{ uid={uid} count={count} updateType={upd} data=0x{data:X16}{bitTag}{tail}{fullBody} }}";
         }
 
         // MSG_INTERACT (1022): 28-byte struct. Use the existing InteractPacket
