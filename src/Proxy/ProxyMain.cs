@@ -1161,14 +1161,31 @@ namespace ConquerRevObserver
         /// The server never sees this. If the client renders the visual, we've
         /// demonstrated that proxy-level visual spoofing still works on Rev 5517.
         ///
-        /// Packet layout (matches Redux/Packets/Game/[1017] UpdatePacket.cs):
-        ///   [0..1]   size = packet length minus 8 (excluding trailer)
-        ///   [2..3]   type = 1017 (MSG_UPDATE)
-        ///   [4..7]   UID  = player's own UID
+        /// Packet layout. 5065 had MSG_UPDATE=1017 with a 20-byte body
+        /// (uid:4 count:4 updateType:4 data:8). Rev 5517 uses type=10017
+        /// and the real packets on the wire are 44 bytes total (32-byte
+        /// body), so there are 12 extra bytes somewhere — fields the new
+        /// build added that we haven't reverse-engineered. We zero-pad the
+        /// tail to match the observed on-wire size; if the client validates
+        /// the size strictly, our fake at the old 32-byte length would be
+        /// rejected silently.
+        ///
+        ///   [0..1]   size = 36 (packet length minus 8)
+        ///   [2..3]   type = 10017
+        ///   [4..7]   UID
         ///   [8..11]  count = 1
-        ///   [12..15] UpdateType = 26 (StatusEffects)
-        ///   [16..23] Data = 64-bit ClientEffect bitmask; bit 23 = Cyclone
-        ///   [24..31] "TQServer" trailer (ASCII)
+        ///   [12..15] UpdateType = 26 (StatusEffects in 5065 — value may
+        ///                          have moved in 5517; verify against
+        ///                          a real Update packet's updateType field)
+        ///   [16..23] Data = 64-bit ClientEffect bitmask (bit 23 = Cyclone in 5065)
+        ///   [24..35] padding (12 bytes of zeros)
+        ///   [36..43] "TQServer" trailer
+        ///
+        /// Two unknowns remain that could explain the visual not rendering:
+        ///   - UpdateType 26 may not be StatusEffects on 5517.
+        ///   - Bit 23 may not be Cyclone on 5517.
+        /// Cross-check by triggering Cyclone normally and watching the
+        /// s->c [Update? #10017] body for the updateType / data values.
         /// </summary>
         private unsafe void SendFakeCycloneToClient(bool enable)
         {
@@ -1178,15 +1195,21 @@ namespace ConquerRevObserver
                 return;
             }
             ulong data = enable ? ConquerPoc.Constants.CLIENT_EFFECT_CYCLONE : 0UL;
-            var pkt = new byte[32];
+            // 44 bytes total: 4 header + 32 body + 8 trailer. Body matches the
+            // size we see on real Rev 5517 Update packets on the wire.
+            var pkt = new byte[44];
             fixed (byte* ptr = pkt)
             {
                 *((ushort*)ptr) = (ushort)(pkt.Length - 8);
-                *((ushort*)(ptr + 2)) = ConquerPoc.Constants.MSG_UPDATE;
+                *((ushort*)(ptr + 2)) = ConquerPoc.Constants5517.MSG_UPDATE_LIKE;
                 *((uint*)(ptr + 4)) = _activePlayerUid;
                 *((uint*)(ptr + 8)) = 1;
                 *((uint*)(ptr + 12)) = ConquerPoc.Constants.UPDATE_TYPE_STATUS_EFFECTS;
                 *((ulong*)(ptr + 16)) = data;
+                // [24..35] already zero (default array init). If 5517 needs
+                // specific values here, we'll see the visual still not render
+                // and need to dump a real Update for the same updateType
+                // value to copy the byte pattern.
             }
             // Trailer (the client validates this; without it, the client
             // closes the TCP connection).

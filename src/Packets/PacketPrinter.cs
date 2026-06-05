@@ -130,13 +130,27 @@ namespace ConquerPoc.Packets
             return $"{{ uid={uid} body={len}b }}";
         }
 
-        // MSG_UPDATE (1017 / 10017): generic. UID at offset 4-7, updateType variable.
+        // MSG_UPDATE (1017 / 10017): uid:u32 at 4-7, count:u32 at 8-11,
+        // updateType:u32 at 12-15, data:u64 at 16-23. Rev 5517 has 12 extra
+        // bytes of body we don't yet understand — show their hex so we
+        // can reverse-engineer the layout from observed packets.
         private static string ParseUpdate(byte[] b, int off, int len)
         {
             if (len < 12) return null;
             uint uid = ReadU32(b, off + 4);
+            uint count = len >= 12 ? (uint)ReadU32(b, off + 8) : 0;
             uint upd = len >= 16 ? (uint)ReadU32(b, off + 12) : 0;
-            return $"{{ uid={uid} updateType={upd} }}";
+            ulong data = len >= 24 ? (ulong)BitConverter.ToUInt64(b, off + 16) : 0UL;
+            string tail = "";
+            if (len > 24)
+            {
+                int extra = len - 24;
+                int dumpLen = System.Math.Min(extra, 12);
+                var sb = new StringBuilder();
+                for (int i = 0; i < dumpLen; i++) sb.Append(b[off + 24 + i].ToString("X2"));
+                tail = $" extra[{extra}b]={sb}";
+            }
+            return $"{{ uid={uid} count={count} updateType={upd} data=0x{data:X16}{tail} }}";
         }
 
         // MSG_INTERACT (1022): 28-byte struct. Use the existing InteractPacket
