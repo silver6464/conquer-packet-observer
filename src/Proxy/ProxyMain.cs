@@ -56,6 +56,26 @@ namespace ConquerRevObserver
 
         public static OperatingMode Mode { get; private set; } = OperatingMode.ObserveOnly;
 
+        /// <summary>
+        /// Override for the player UID used by fake-visual injection. 0 means
+        /// "auto-detect via MSG_CONNECT on the c->s stream"; non-zero means
+        /// "use this value regardless of what we see on the wire." Useful
+        /// when MSG_CONNECT was missed (e.g. arrived pre-keyfile) or when
+        /// you want to inject for a specific known character.
+        /// </summary>
+        public static uint OverridePlayerUid { get; private set; } = 0;
+
+        /// <summary>
+        /// Which bit of the StatusEffects bitmask to set in the fake Update
+        /// packet. Default = 23 = "Tornado" on the live Rev 5187 client
+        /// (matches 5065's CLIENT_EFFECT_CYCLONE). Other cyc-related bits
+        /// per the live statuseffect.ini: 45 (cyclonecyc), 46
+        /// (cyclonehandcycle), 54 (Status_Stop_cyc), 59 (frost_cyc), 60
+        /// (chaos_cyc). Try different bits if bit 23 doesn't render the
+        /// expected visual.
+        /// </summary>
+        public static int InjectEffectBit { get; private set; } = 23;
+
         public static void Main(string[] args)
         {
             for (int i = 0; i < args.Length; i++)
@@ -71,6 +91,24 @@ namespace ConquerRevObserver
                     else if (v == "active-mitm" || v == "mitm") Mode = OperatingMode.ActiveMitM;
                     else { Console.Error.WriteLine($"unknown --mode '{v}'; valid: observe-only | active-mitm"); System.Environment.Exit(2); }
                 }
+                else if (args[i] == "--player-uid" && i + 1 < args.Length)
+                {
+                    if (!uint.TryParse(args[++i], out var uid) || uid == 0)
+                    {
+                        Console.Error.WriteLine($"--player-uid expects a positive uint; got '{args[i]}'");
+                        System.Environment.Exit(2);
+                    }
+                    OverridePlayerUid = uid;
+                }
+                else if (args[i] == "--effect-bit" && i + 1 < args.Length)
+                {
+                    if (!int.TryParse(args[++i], out var bit) || bit < 0 || bit > 63)
+                    {
+                        Console.Error.WriteLine($"--effect-bit expects 0..63; got '{args[i]}'");
+                        System.Environment.Exit(2);
+                    }
+                    InjectEffectBit = bit;
+                }
             }
             Directory.CreateDirectory(KeyfileDir);
 
@@ -85,6 +123,11 @@ namespace ConquerRevObserver
                 Log("proxy", " ACTIVE MitM MODE — proxy will RE-ENCRYPT both directions.");
                 Log("proxy", " Chat command '@cyclone' will fire a client-only fake visual");
                 Log("proxy", " injection test. Use only against operator-authorized servers.");
+                if (OverridePlayerUid != 0)
+                    Log("proxy", $" Inject target UID (override): {OverridePlayerUid}");
+                else
+                    Log("proxy", $" Inject target UID: auto-detect from MSG_CONNECT");
+                Log("proxy", $" Inject effect bit: {InjectEffectBit} (data = 1 << {InjectEffectBit})");
                 Log("proxy", "============================================================");
             }
             Log("proxy", "Configure Proxifier: Proxy Server type=SOCKS5, host=<this machine's Tailscale IP>, port=1080");
@@ -1333,21 +1376,34 @@ namespace ConquerRevObserver
                 ProxyMain.Log("inject", "WARN: ciphers not ready; cannot inject");
                 return;
             }
-            ulong data = enable ? ConquerPoc.Constants.CLIENT_EFFECT_CYCLONE : 0UL;
-            // 44 bytes total: 4 header + 32 body + 8 trailer. Body matches the
-            // size we see on real Rev 5517 Update packets on the wire.
+            // Resolve the target UID: CLI override takes precedence over the
+            // auto-captured one from MSG_CONNECT. This is the escape hatch for
+            // when MSG_CONNECT arrived pre-keyfile and capture missed it.
+            uint targetUid = ProxyMain.OverridePlayerUid != 0
+                ? ProxyMain.OverridePlayerUid
+                : _activePlayerUid;
+            if (targetUid == 0)
+            {
+                ProxyMain.Log("inject", "WARN: no player UID known (MSG_CONNECT missed and no --player-uid override); skipping");
+                return;
+            }
+
+            ulong data = enable ? (1UL << ProxyMain.InjectEffectBit) : 0UL;
+            // 44 bytes total: 4 header + 32 body + 8 trailer. Body matches
+            // the size of real Rev 5517 MsgUserAttrib (#10017) packets seen
+            // on the wire.
             var pkt = new byte[44];
             fixed (byte* ptr = pkt)
             {
                 *((ushort*)ptr) = (ushort)(pkt.Length - 8);
                 *((ushort*)(ptr + 2)) = ConquerPoc.Constants5517.MSG_UPDATE_LIKE;
-                *((uint*)(ptr + 4)) = _activePlayerUid;
+                *((uint*)(ptr + 4)) = targetUid;
                 *((uint*)(ptr + 8)) = 1;
                 *((uint*)(ptr + 12)) = ConquerPoc.Constants.UPDATE_TYPE_STATUS_EFFECTS;
                 *((ulong*)(ptr + 16)) = data;
-                // [24..35] already zero. If the 5187 server expects specific
-                // values in those 12 bytes, we'll need to capture a real
-                // Update(StatusEffects) packet first and copy the pattern.
+                // [24..35] already zero. The 12 trailing body bytes are
+                // unknown — we'll need to capture a real Update(StatusEffects)
+                // for this build to find out what (if anything) goes here.
             }
             // Trailer (the client validates this).
             var seal = System.Text.Encoding.ASCII.GetBytes("TQServer");
@@ -1399,7 +1455,7 @@ namespace ConquerRevObserver
             try
             {
                 _cs.Write(pkt, 0, pkt.Length);
-                ProxyMain.Log("inject", $"sent fake UpdatePacket(StatusEffects=0x{data:X16}) to client UID={_activePlayerUid}");
+                ProxyMain.Log("inject", $"sent fake UpdatePacket(StatusEffects=0x{data:X16}, bit={ProxyMain.InjectEffectBit}) to client UID={targetUid}");
                 ProxyMain.Log("inject", "post-inject: client's s->c IV is now 44 bytes ahead of server's; subsequent real bytes will garble. Session is effectively hosed.");
             }
             catch (Exception e)
