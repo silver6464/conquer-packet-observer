@@ -60,10 +60,7 @@ namespace ConquerPoc.Packets
             {
                 case 1004: return ParseTalk(chunk, bodyStart, bodyLen);
                 case 1005: return ParseWalk5065(chunk, bodyStart, bodyLen);
-                // 10005 Walk body layout on Rev 5517 isn't fully nailed down.
-                // Leave it to the hex fallback; we get the type label right
-                // from the registry.
-                case 10005: return null;
+                case 10005: return ParseWalk5517(chunk, bodyStart, bodyLen);
                 case 1006: return ParseUserInfo(chunk, bodyStart, bodyLen);
                 case 1008: return ParseItemInfo(chunk, bodyStart, bodyLen);
                 case 1009: return ParseItem(chunk, bodyStart, bodyLen);
@@ -106,8 +103,7 @@ namespace ConquerPoc.Packets
                 : $"{{ ch={channel} <{speaker}>->{hearer} {Q(text)} }}";
         }
 
-        // MSG_WALK (5065 #1005): uid:u32, dir:u8, mode:u8. Rev 5517's #10005
-        // uses a different body layout — not parsed (see TryParseBody switch).
+        // MsgWalk (5065 #1005): uid:u32, dir:u8, mode:u8.
         private static string ParseWalk5065(byte[] b, int off, int len)
         {
             if (len < 6) return null;
@@ -118,21 +114,60 @@ namespace ConquerPoc.Packets
             return $"{{ uid={uid} dir={dir} mode={mode} }}";
         }
 
-        // MsgAction (1010 / 10010): generic request/response. Patch 5517
-        // layout per conquer-wiki: CharacterID:u32 Command:u32 Args[2]:u16
-        // Timestamp:u32 Action:u16 Direction:u16 X:u16 Y:u16 Map:u32 Color:u32.
-        // We show the most useful fields and the action name.
+        // MsgWalk (Rev 5517 #10005). Wiki patch-5517 layout:
+        //   direction:u32 at offset 4, characterId:u32 at 8, movementType:u32
+        //   at 12, timestamp:u32 at 16, mapId:u32 at 20. Total body=20.
+        // Rev observed body size = 12. So this build appears to be a stripped
+        // variant carrying just: direction:u32, characterId:u32, timestamp:u32.
+        // Direction values often have upper bits set (e.g. 0x1A=26) so we
+        // surface both the raw u32 and the low-byte direction name.
+        private static string ParseWalk5517(byte[] chunk, int bodyOff, int bodyLen)
+        {
+            if (bodyLen < 12) return null;
+            uint dirRaw = ReadU32(chunk, bodyOff);
+            uint uid    = ReadU32(chunk, bodyOff + 4);
+            uint ts     = ReadU32(chunk, bodyOff + 8);
+            byte dirByte = (byte)(dirRaw & 0xFF);
+            string dirName = dirByte < DIRECTION_NAMES.Length ? DIRECTION_NAMES[dirByte] : $"d{dirByte}";
+            string dirTag = dirRaw > 8 ? $" dir={dirName}(0x{dirRaw:X8})" : $" dir={dirName}";
+            return $"{{ uid={uid}{dirTag} ts={ts} }}";
+        }
+
+        // MsgAction (1010 / 10010): two on-the-wire variants observed on Rev:
+        //   - LONG (body=28): uid:u32 cmd:u32 args[2]:u16 ts:u32 action:u16
+        //                     direction:u16 X:u16 Y:u16 map:u32 color:u32.
+        //                     This is the patch-5517 layout from the wiki.
+        //   - SHORT (body=24): uid:u32 cmd:u32 ts:u32 action:u32 pad:u64.
+        //                     Server-side acks/echoes that don't carry the
+        //                     full request payload back.
+        // We pick the layout by body length.
         private static string ParseAction(byte[] b, int off, int len)
         {
-            if (len < 28) return null;
+            if (len < 24) return null;
             uint chrId = ReadU32(b, off);
             uint cmd   = ReadU32(b, off + 4);
-            uint ts    = ReadU32(b, off + 12);
-            ushort act = (ushort)ReadU16(b, off + 16);
-            ushort dir = (ushort)ReadU16(b, off + 18);
-            ushort x   = (ushort)ReadU16(b, off + 20);
-            ushort y   = (ushort)ReadU16(b, off + 22);
-            return $"{{ chr={chrId} cmd={cmd} ts={ts} action={ActionName(act)}({act}) dir={dir} pos=({x},{y}) }}";
+
+            if (len >= 28)
+            {
+                // LONG variant
+                uint ts    = ReadU32(b, off + 12);
+                ushort act = (ushort)ReadU16(b, off + 16);
+                ushort dir = (ushort)ReadU16(b, off + 18);
+                ushort x   = (ushort)ReadU16(b, off + 20);
+                ushort y   = (ushort)ReadU16(b, off + 22);
+                string posTag = (x != 0 || y != 0) ? $" pos=({x},{y})" : "";
+                string dirTag = dir != 0 ? $" dir={dir}" : "";
+                string cmdTag = cmd != 0 ? $" cmd={cmd}" : "";
+                return $"{{ chr={chrId} ts={ts} {ActionName(act)}({act}){dirTag}{posTag}{cmdTag} }}";
+            }
+            else
+            {
+                // SHORT variant
+                uint ts  = ReadU32(b, off + 8);
+                uint act = ReadU32(b, off + 12);
+                string cmdTag = cmd != 0 ? $" cmd={cmd}" : "";
+                return $"{{ chr={chrId} ts={ts} {ActionName((ushort)act)}({act}){cmdTag} }}";
+            }
         }
 
         // MsgPlayer (1014 / 10014): spawn-entity, ~140-byte variable body.
@@ -162,13 +197,16 @@ namespace ConquerPoc.Packets
             ulong v2 = len >= 28 ? BitConverter.ToUInt64(b, off + 20) : 0UL;
             uint v3 = len >= 32 ? (uint)ReadU32(b, off + 28) : 0;
 
-            // Show v1 as a status-effects bit list only when this is
-            // actually a StatusEffects update (statusType is the wiki's
-            // STATUS enum; the live statuseffect.ini key 23 = CYCLONE is
-            // a *bit position in v1*, not a statusType value).
             string statusName = StatusEffectName(status);
-            string bitTag = "";
-            if (v1 != 0)
+
+            // For most statusTypes, v1 is just a number (HP, mana, exp, money,
+            // level, etc.) and the "bit positions set" interpretation is
+            // meaningless noise. ONLY render the bit list when statusType is
+            // StatusEffects (26), which is when v1 is genuinely a bitmask
+            // per the statuseffect.ini enum.
+            const uint TYPE_STATUS_EFFECTS = 26;
+            string body;
+            if (status == TYPE_STATUS_EFFECTS && v1 != 0)
             {
                 var bits = new System.Collections.Generic.List<string>();
                 for (int i = 0; i < 64; i++)
@@ -177,11 +215,20 @@ namespace ConquerPoc.Packets
                     string nm = StatusEffectBitName(i);
                     bits.Add(nm != null ? $"{i}({nm})" : i.ToString());
                 }
-                bitTag = $" bits=[{string.Join(",", bits)}]";
+                string v2tag = v2 != 0 ? $" v2=0x{v2:X16}" : "";
+                string v3tag = v3 != 0 ? $" v3={v3}" : "";
+                body = $"v1=0x{v1:X16} bits=[{string.Join(",", bits)}]{v2tag}{v3tag}";
             }
-            string tail = v3 != 0 ? $" v3={v3}" : "";
-            string v2tag = v2 != 0 ? $" v2=0x{v2:X16}" : "";
-            return $"{{ uid={uid} cnt={count} status={statusName}({status}) v1=0x{v1:X16}{bitTag}{v2tag}{tail} }}";
+            else
+            {
+                // Generic stat update — show v1 as a plain decimal value,
+                // which reads naturally for HP/exp/money/level/etc.
+                string v2tag = v2 != 0 ? $" v2={v2}" : "";
+                string v3tag = v3 != 0 ? $" v3={v3}" : "";
+                body = $"v1={v1}{v2tag}{v3tag}";
+            }
+            string countTag = count != 1 ? $" cnt={count}" : "";
+            return $"{{ uid={uid}{countTag} {statusName} {body} }}";
         }
 
         // MsgInteract (1022): 28-byte struct (incl. header+trailer math).
